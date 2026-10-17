@@ -6,4 +6,4 @@
 
 ### Functional
 
-- [libSceJpegDec](../../../core/libs/prx/libSceJpegDec/Export.cpp) (libSceJpegDec) - decode modes other than 0 and down scales other than 1 throw
+- [libSceJpegDec](../../../core/libs/prx/libSceJpegDec/Export.cpp) (libSceJpegDec) - normal decoding supports down scales 1, 2, 4 and 8, the factors named by [SharpProspero's bindings](https://github.com/SvenGDK/SharpProspero/blob/5dfdb4b0b166e83dc9ae275001afb695f12c7174/src/SharpProspero/Interop/Image/JpegDec.cs#L49-L53). Scales 2, 4 and 8 use the bundled libjpeg-turbo's scaled IDCT for 8-bit lossy grayscale, RGB and YCbCr images; other precision, lossless images and other color spaces throw. Output dimensions round up, following libjpeg-turbo's `TJSCALED`, and the packed decode result uses the output dimensions. Console dimension rounding, scaled pixel values and the packed result are unmeasured. Scale 1 retains the existing stb decoder. Decode modes other than 0 and other scale factors throw.

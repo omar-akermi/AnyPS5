@@ -31,7 +31,6 @@ constexpr std::uint32_t MEMORY_SIZE = 0x20;
 constexpr std::uintptr_t HANDLE_ALIGNMENT = 8;
 
 constexpr std::uint16_t DECODE_MODE_NORMAL = 0;
-constexpr std::uint16_t DOWN_SCALE_NONE = 1;
 
 constexpr std::uint16_t PIXEL_FORMAT_R8G8B8A8 = 0;
 constexpr std::uint16_t PIXEL_FORMAT_B8G8R8A8 = 1;
@@ -57,7 +56,8 @@ std::int32_t validateCreateParam(const JpegDecCreateParam* param) {
 
 void requireNormalDecode(const char* function, std::uint16_t decodeMode, std::uint16_t downScale) {
     if (decodeMode != DECODE_MODE_NORMAL) throw std::runtime_error(std::string(function) + ": decode mode " + std::to_string(decodeMode) + " is not implemented");
-    if (downScale != DOWN_SCALE_NONE) throw std::runtime_error(std::string(function) + ": down scale " + std::to_string(downScale) + " is not implemented");
+    if (downScale != 1 && downScale != 2 && downScale != 4 && downScale != 8)
+        throw std::runtime_error(std::string(function) + ": down scale " + std::to_string(downScale) + " is not implemented");
 }
 
 Context* toContext(void* handle) {
@@ -67,15 +67,15 @@ Context* toContext(void* handle) {
     return context->self == context ? context : nullptr;
 }
 
-void fillImageInfo(const Decoder::Jpeg::Header& header, JpegDecImageInfo* info) {
+void fillImageInfo(const Decoder::Jpeg::Header& header, std::uint16_t downScale, JpegDecImageInfo* info) {
     *info = {};
     info->image_width = header.width;
     info->image_height = header.height;
     info->color_space = COLOR_SPACE_RGB;
     info->component_number = static_cast<std::uint16_t>(header.channels);
     info->suitable_csc_attribute = ATTRIBUTE_CSC_ORDINARY;
-    info->output_image_width = header.width;
-    info->output_image_height = header.height;
+    info->output_image_width = (header.width + downScale - 1) / downScale;
+    info->output_image_height = (header.height + downScale - 1) / downScale;
 }
 
 std::span<const std::uint8_t> toBytes(const void* data, std::uint32_t size) {
@@ -114,13 +114,15 @@ int32_t APS5_VABI sceJpegDecDecode(void* handle, const JpegDecDecodeParam* param
     const std::optional<Decoder::Jpeg::Header> header = Decoder::Jpeg::ParseHeader(jpeg);
     if (!header) return SCE_JPEG_DEC_ERROR_INVALID_DATA;
 
-    const std::uint64_t rowSize = static_cast<std::uint64_t>(header->width) * BYTES_PER_PIXEL;
+    const std::uint32_t outputWidth = (header->width + param->down_scale - 1) / param->down_scale;
+    const std::uint32_t outputHeight = (header->height + param->down_scale - 1) / param->down_scale;
+    const std::uint64_t rowSize = static_cast<std::uint64_t>(outputWidth) * BYTES_PER_PIXEL;
     const std::uint64_t pitch = param->image_pitch == 0 ? rowSize : param->image_pitch;
     if (pitch < rowSize) return SCE_JPEG_DEC_ERROR_INVALID_PARAM;
-    if ((header->height - 1) * pitch + rowSize > param->image_mem_size) return SCE_JPEG_DEC_ERROR_INVALID_SIZE;
+    if ((outputHeight - 1) * pitch + rowSize > param->image_mem_size) return SCE_JPEG_DEC_ERROR_INVALID_SIZE;
 
-    const std::optional<Decoder::Jpeg::Image> image = Decoder::Jpeg::Decode(jpeg);
-    if (!image || image->width != header->width || image->height != header->height) return SCE_JPEG_DEC_ERROR_DECODE_ERROR;
+    const std::optional<Decoder::Jpeg::Image> image = Decoder::Jpeg::Decode(jpeg, param->down_scale);
+    if (!image || image->width != outputWidth || image->height != outputHeight) return SCE_JPEG_DEC_ERROR_DECODE_ERROR;
 
     const bool swapRedBlue = param->pixel_format == PIXEL_FORMAT_B8G8R8A8;
     const auto alpha = static_cast<std::uint8_t>(param->alpha_value);
@@ -144,9 +146,9 @@ int32_t APS5_VABI sceJpegDecDecode(void* handle, const JpegDecDecodeParam* param
         }
     }
 
-    if (image_info) fillImageInfo(*header, image_info);
-    if (header->width > MAX_PACKED_DIMENSION || header->height > MAX_PACKED_DIMENSION) return 0;
-    return static_cast<std::int32_t>(header->width << 16 | header->height);
+    if (image_info) fillImageInfo(*header, param->down_scale, image_info);
+    if (outputWidth > MAX_PACKED_DIMENSION || outputHeight > MAX_PACKED_DIMENSION) return 0;
+    return static_cast<std::int32_t>(outputWidth << 16 | outputHeight);
 }
 
 int32_t APS5_VABI sceJpegDecDelete(void* handle) {
@@ -163,7 +165,7 @@ int32_t APS5_VABI sceJpegDecParseHeader(const JpegDecParseParam* param, JpegDecI
     requireNormalDecode(__func__, param->decode_mode, param->down_scale);
     const std::optional<Decoder::Jpeg::Header> header = Decoder::Jpeg::ParseHeader(toBytes(param->jpeg_mem_addr, param->jpeg_mem_size));
     if (!header) return SCE_JPEG_DEC_ERROR_INVALID_DATA;
-    fillImageInfo(*header, image_info);
+    fillImageInfo(*header, param->down_scale, image_info);
     return 0;
 }
 

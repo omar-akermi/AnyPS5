@@ -34,6 +34,7 @@ std::vector<std::uint8_t> Encode(std::span<const std::uint8_t> pixels, std::uint
 std::optional<Header> ParseHeader(std::span<const std::uint8_t> jpeg);
 
 std::optional<Image> Decode(std::span<const std::uint8_t> jpeg);
+std::optional<Image> Decode(std::span<const std::uint8_t> jpeg, std::uint32_t downScale);
 
 }  // namespace Decoder::Jpeg
 

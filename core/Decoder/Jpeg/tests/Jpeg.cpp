@@ -104,6 +104,30 @@ int main() {
     Require(ThrowsInvalidArgument([&] { Decoder::Jpeg::Encode(rgb, width, height, 3, 90, Decoder::Jpeg::Sampling::Yuv444, 0x10000, 0); }));
     Require(ThrowsInvalidArgument([&] { Decoder::Jpeg::Encode(rgb, width, height, 3, 90, Decoder::Jpeg::Sampling::Yuv444, 0, 0x10000); }));
 
+    for (std::uint32_t scale : {2u, 4u, 8u}) {
+        const auto scaled = Decoder::Jpeg::Decode(rgbJpeg, scale);
+        Require(scaled && scaled->width == (width + scale - 1) / scale && scaled->height == (height + scale - 1) / scale);
+        Require(scaled->channels == 3 && scaled->pixels.size() == scaled->width * scaled->height * 3);
+        const auto scaledGray = Decoder::Jpeg::Decode(grayJpeg, scale);
+        Require(scaledGray && scaledGray->channels == 1 && scaledGray->width == (width + scale - 1) / scale);
+        Require(scaledGray->height == (height + scale - 1) / scale);
+        Require(scaledGray->pixels.size() == scaledGray->width * scaledGray->height);
+        Require(!Decoder::Jpeg::Decode({}, scale));
+        for (const auto size : {std::size_t{2}, rgbJpeg.size() / 2, rgbJpeg.size() - 2})
+            Require(!Decoder::Jpeg::Decode(std::span<const std::uint8_t>(rgbJpeg.data(), size), scale));
+    }
+    for (std::uint32_t scale : {0u, 3u, 16u, UINT32_MAX})
+        Require(ThrowsInvalidArgument([&] { Decoder::Jpeg::Decode(rgbJpeg, scale); }));
+    const auto unscaled = Decoder::Jpeg::Decode(rgbJpeg, 1);
+    Require(unscaled && unscaled->pixels == rgbImage->pixels);
+    std::vector<std::uint8_t> checker(8 * 8);
+    for (std::uint32_t y = 0; y < 8; ++y)
+        for (std::uint32_t x = 0; x < 8; ++x) checker[y * 8 + x] = (x + y) % 2 ? 255 : 0;
+    const auto checkerJpeg = Decoder::Jpeg::Encode(checker, 8, 8, 1, 100);
+    const auto average = Decoder::Jpeg::Decode(checkerJpeg, 8);
+    Require(average && average->width == 1 && average->height == 1 && average->channels == 1);
+    Require(Difference(average->pixels[0], 128) <= 1);
+
     Require(!Decoder::Jpeg::Decode({}).has_value());
     const std::vector<std::uint8_t> garbage{1, 2, 3, 4, 5, 6, 7, 8};
     Require(!Decoder::Jpeg::Decode(garbage).has_value());

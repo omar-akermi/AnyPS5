@@ -1,6 +1,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "Decoder/Jpeg.hpp"
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -65,6 +66,67 @@ static JpegDecDecodeParam DecodeParam(const std::vector<std::uint8_t>& jpeg, std
     return param;
 }
 
+static void CheckDownscale(void* handle, std::uint32_t width, std::uint32_t height, std::uint32_t channels,
+                           Decoder::Jpeg::Sampling sampling) {
+    const std::uint8_t color[] = {40, 110, 180};
+    std::vector<std::uint8_t> source(static_cast<std::size_t>(width) * height * channels);
+    for (std::size_t pixel = 0; pixel < source.size() / channels; ++pixel)
+        for (std::size_t channel = 0; channel < channels; ++channel) source[pixel * channels + channel] = color[channel];
+    const auto jpeg = Decoder::Jpeg::Encode(source, width, height, channels, 100, sampling);
+    for (std::uint16_t scale : {2, 4, 8}) {
+        const std::uint32_t outputWidth = (width + scale - 1) / scale;
+        const std::uint32_t outputHeight = (height + scale - 1) / scale;
+        const std::uint32_t rowSize = outputWidth * 4;
+        JpegDecImageInfo info{};
+        const JpegDecParseParam parse{jpeg.data(), static_cast<std::uint32_t>(jpeg.size()), 0, scale};
+        Require(sceJpegDecParseHeader(&parse, &info) == 0);
+        Require(info.image_width == width && info.image_height == height && info.component_number == channels);
+        Require(info.output_image_width == outputWidth && info.output_image_height == outputHeight);
+        std::vector<std::uint8_t> incompleteOutput(outputWidth * outputHeight * 4 + 16, 0xcc);
+        auto incomplete = DecodeParam(jpeg, incompleteOutput, 0);
+        incomplete.down_scale = scale;
+        incomplete.jpeg_mem_size -= 2;
+        Require(sceJpegDecDecode(handle, &incomplete, nullptr) == static_cast<std::int32_t>(0x80690012));
+        Require(std::all_of(incompleteOutput.begin(), incompleteOutput.end(), [](auto byte) { return byte == 0xcc; }));
+        for (std::uint16_t format : {0, 1}) {
+            for (std::uint32_t pitch : {0u, rowSize, rowSize + 7}) {
+                const auto stride = pitch ? pitch : rowSize;
+                const auto size = (outputHeight - 1) * stride + rowSize;
+                std::vector<std::uint8_t> output(size + 16, 0xcc);
+                auto param = DecodeParam(jpeg, output, pitch);
+                param.image_mem_size = size;
+                param.down_scale = scale;
+                param.pixel_format = format;
+                param.alpha_value = 0x77;
+                Require(sceJpegDecDecode(handle, &param, &info) == static_cast<std::int32_t>(outputWidth << 16 | outputHeight));
+                Require(info.image_width == width && info.image_height == height);
+                Require(info.output_image_width == outputWidth && info.output_image_height == outputHeight);
+                for (std::uint32_t y = 0; y < outputHeight; ++y) {
+                    for (std::uint32_t x = 0; x < outputWidth; ++x) {
+                        const auto* pixel = output.data() + y * stride + x * 4;
+                        for (std::uint32_t channel = 0; channel < 3; ++channel) {
+                            const auto expected = color[channels == 1 ? 0 : format == 1 ? 2 - channel : channel];
+                            Require(std::abs(static_cast<int>(pixel[channel]) - expected) <= 3);
+                        }
+                        Require(pixel[3] == 0x77);
+                    }
+                    if (y + 1 < outputHeight)
+                        for (std::uint32_t byte = rowSize; byte < stride; ++byte) Require(output[y * stride + byte] == 0xcc);
+                }
+                Require(std::all_of(output.begin() + size, output.end(), [](auto byte) { return byte == 0xcc; }));
+                std::fill(output.begin(), output.end(), 0xcc);
+                param.image_mem_size = size - 1;
+                Require(sceJpegDecDecode(handle, &param, nullptr) == static_cast<std::int32_t>(0x80690002));
+                Require(std::all_of(output.begin(), output.end(), [](auto byte) { return byte == 0xcc; }));
+                param.image_mem_size = size;
+                param.image_pitch = rowSize - 1;
+                Require(sceJpegDecDecode(handle, &param, nullptr) == static_cast<std::int32_t>(0x80690003));
+                Require(std::all_of(output.begin(), output.end(), [](auto byte) { return byte == 0xcc; }));
+            }
+        }
+    }
+}
+
 int main() {
     constexpr std::int32_t invalidAddr = static_cast<std::int32_t>(0x80690001);
     constexpr std::int32_t invalidSize = static_cast<std::int32_t>(0x80690002);
@@ -80,8 +142,10 @@ int main() {
     Require(sceJpegDecParseHeader(&parseParam, nullptr) == invalidAddr);
     const JpegDecParseParam emptyParam{nullptr, 0, 0, 1};
     Require(sceJpegDecParseHeader(&emptyParam, &info) == invalidAddr);
-    const JpegDecParseParam downScaledParse{jpeg.data(), static_cast<std::uint32_t>(jpeg.size()), 0, 2};
-    Require(ThrowsRuntimeError([&] { sceJpegDecParseHeader(&downScaledParse, &info); }));
+    for (std::uint16_t scale : {0, 3, 16, UINT16_MAX}) {
+        const JpegDecParseParam unsupportedScale{jpeg.data(), static_cast<std::uint32_t>(jpeg.size()), 0, scale};
+        Require(ThrowsRuntimeError([&] { sceJpegDecParseHeader(&unsupportedScale, &info); }));
+    }
     const std::vector<std::uint8_t> grayJpeg = TestJpeg(3, 2, 1);
     const JpegDecParseParam grayParse{grayJpeg.data(), static_cast<std::uint32_t>(grayJpeg.size()), 0, 1};
     Require(sceJpegDecParseHeader(&grayParse, &info) == 0);
@@ -125,9 +189,11 @@ int main() {
     JpegDecDecodeParam badFormat = decodeParam;
     badFormat.pixel_format = 2;
     Require(sceJpegDecDecode(handle, &badFormat, &info) == invalidParam);
-    JpegDecDecodeParam downScaled = decodeParam;
-    downScaled.down_scale = 2;
-    Require(ThrowsRuntimeError([&] { sceJpegDecDecode(handle, &downScaled, &info); }));
+    for (std::uint16_t scale : {0, 3, 16, UINT16_MAX}) {
+        JpegDecDecodeParam unsupportedScale = decodeParam;
+        unsupportedScale.down_scale = scale;
+        Require(ThrowsRuntimeError([&] { sceJpegDecDecode(handle, &unsupportedScale, &info); }));
+    }
     JpegDecDecodeParam otherMode = decodeParam;
     otherMode.decode_mode = 1;
     Require(ThrowsRuntimeError([&] { sceJpegDecDecode(handle, &otherMode, &info); }));
@@ -164,6 +230,13 @@ int main() {
     const JpegDecDecodeParam garbageDecode = DecodeParam(garbage, garbageOut, 4 * 4);
     Require(sceJpegDecDecode(handle, &garbageDecode, &info) == invalidData);
 
+    for (const auto sampling : {Decoder::Jpeg::Sampling::Yuv444, Decoder::Jpeg::Sampling::Yuv422, Decoder::Jpeg::Sampling::Yuv420}) {
+        for (std::uint32_t channels : {1u, 3u}) {
+            CheckDownscale(handle, 17, 9, channels, sampling);
+            CheckDownscale(handle, 16, 8, channels, sampling);
+            CheckDownscale(handle, 1, 1, channels, sampling);
+        }
+    }
     Require(sceJpegDecDelete(handle) == 0);
     return 0;
 }

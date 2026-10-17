@@ -19,8 +19,8 @@ constexpr std::uint32_t MAX_DIMENSION = 0xFFFF;
 
 class Handle {
 public:
-    Handle() : handle(tj3Init(TJINIT_COMPRESS)) {
-        if (!handle) throw std::runtime_error("Jpeg::Encode: encoder initialization failed");
+    explicit Handle(int mode = TJINIT_COMPRESS) : handle(tj3Init(mode)) {
+        if (!handle) throw std::runtime_error(mode == TJINIT_COMPRESS ? "Jpeg::Encode: encoder initialization failed" : "Jpeg::Decode: decoder initialization failed");
     }
     ~Handle() { tj3Destroy(handle); }
     Handle(const Handle&) = delete;
@@ -103,6 +103,33 @@ std::optional<Image> Decode(std::span<const std::uint8_t> jpeg) {
     Image image{static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height), static_cast<std::uint32_t>(channels), {}};
     image.pixels.assign(decoded, decoded + static_cast<std::size_t>(image.width) * image.height * image.channels);
     stbi_image_free(decoded);
+    return image;
+}
+
+std::optional<Image> Decode(std::span<const std::uint8_t> jpeg, std::uint32_t downScale) {
+    if (downScale == 1) return Decode(jpeg);
+    if (downScale != 2 && downScale != 4 && downScale != 8)
+        throw std::invalid_argument("Jpeg::Decode: unsupported down scale");
+    if (jpeg.empty() || jpeg.size() > INT_MAX) return std::nullopt;
+
+    Handle handle(TJINIT_DECOMPRESS);
+    if (tj3Set(handle, TJPARAM_STOPONWARNING, 1) < 0 || tj3DecompressHeader(handle, jpeg.data(), jpeg.size()) < 0)
+        return std::nullopt;
+    if (tj3Get(handle, TJPARAM_PRECISION) != 8 || tj3Get(handle, TJPARAM_LOSSLESS) != 0)
+        throw std::runtime_error("Jpeg::Decode: scaled decoding requires an 8-bit lossy JPEG");
+    const int colorSpace = tj3Get(handle, TJPARAM_COLORSPACE);
+    if (colorSpace != TJCS_GRAY && colorSpace != TJCS_RGB && colorSpace != TJCS_YCbCr)
+        throw std::runtime_error("Jpeg::Decode: scaled decoding of this color space is not implemented");
+    const int width = tj3Get(handle, TJPARAM_JPEGWIDTH);
+    const int height = tj3Get(handle, TJPARAM_JPEGHEIGHT);
+    if (width <= 0 || height <= 0) return std::nullopt;
+    const tjscalingfactor scale{1, static_cast<int>(downScale)};
+    if (tj3SetScalingFactor(handle, scale) < 0) return std::nullopt;
+    Image image{static_cast<std::uint32_t>(TJSCALED(width, scale)), static_cast<std::uint32_t>(TJSCALED(height, scale)),
+        colorSpace == TJCS_GRAY ? 1u : 3u, {}};
+    image.pixels.resize(static_cast<std::size_t>(image.width) * image.height * image.channels);
+    if (tj3Decompress8(handle, jpeg.data(), jpeg.size(), image.pixels.data(), 0, image.channels == 1 ? TJPF_GRAY : TJPF_RGB) < 0)
+        return std::nullopt;
     return image;
 }
 
