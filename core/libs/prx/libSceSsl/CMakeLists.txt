@@ -46,7 +46,7 @@ function(configure_ssl_backend)
 endfunction()
 
 configure_ssl_backend()
-set_target_properties(mbedcrypto mbedx509 p256m PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(mbedtls mbedcrypto mbedx509 p256m PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(MINGW)
     target_compile_options(mbedcrypto PRIVATE -fno-asynchronous-unwind-tables)
     target_compile_options(mbedx509 PRIVATE -fno-asynchronous-unwind-tables)

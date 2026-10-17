@@ -34,15 +34,9 @@ static void Require(bool value) { if (!value) std::abort(); }
 int main() {
     constexpr int invalidValue = static_cast<int>(0x804311FE);
     constexpr int network = static_cast<int>(0x80431063);
-    Require(sceHttpSetCookieEnabled(1, 0) == 0);
+    Require(sceHttpSetCookieEnabled(1, 0) == static_cast<int>(0x80431100));
     Require(sceHttpSendRequest(1, nullptr, 0) == static_cast<int>(0x80431100));
-    bool cookieUnsupported = false;
-    try {
-        sceHttpSetCookieEnabled(1, 1);
-    } catch (const std::runtime_error& error) {
-        cookieUnsupported = std::string_view(error.what()) == "sceHttpSetCookieEnabled not implemented";
-    }
-    Require(cookieUnsupported);
+    Require(sceHttpSetCookieEnabled(1, 1) == static_cast<int>(0x80431100));
     for (int enabled : {-1, 2, 0x100}) {
         Require(sceHttpSetCookieEnabled(1, enabled) == invalidValue);
     }

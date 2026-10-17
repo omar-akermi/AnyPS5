@@ -330,13 +330,13 @@ int main() {
     Require(sceHttpReadData(1, data, sizeof(data)) == invalidId);
 
     Require(sceHttpCreateRequest2(1, "GET", "/", 0) == invalidId);
-    Require(sceHttpSetInflateGZIPEnabled(1, 0) == 0);
-    Require(sceHttpSetInflateGZIPEnabled(1, 1) == 0);
+    Require(sceHttpSetInflateGZIPEnabled(1, 0) == invalidId);
+    Require(sceHttpSetInflateGZIPEnabled(1, 1) == invalidId);
     Require(sceHttpSetInflateGZIPEnabled(1, 2) == invalidValue);
     Require(sceHttpSetInflateGZIPEnabled(1, -1) == invalidValue);
-    Require(sceHttpsEnableOption(1, 0) == 0);
-    Require(sceHttpsLoadCert(1, 0, nullptr, nullptr, nullptr) == 0);
-    Require(sceHttpsUnloadCert(1) == 0);
+    Require(sceHttpsEnableOption(1, 0) == invalidId);
+    Require(sceHttpsLoadCert(1, 0, nullptr, nullptr, nullptr) == invalidId);
+    Require(sceHttpsUnloadCert(1) == invalidId);
     Require(sceHttpSetResponseHeaderMaxSize(1, 8192) == invalidId);
     Require(sceHttpSetRecvBlockSize(1, 0x4000) == invalidId);
     Require(sceHttpRedirectCacheFlush(1) == 0);
@@ -347,13 +347,13 @@ int main() {
     Require(sceHttpGetLastErrno(1, &httpErrno) == invalidId);
     Require(httpErrno == -1);
     Require(sceHttpGetLastErrno(1, nullptr) == invalidValue);
-    Require(sceHttpsSetSslVersion(1, 0) == 0);
+    Require(sceHttpsSetSslVersion(1, 0) == invalidId);
     Require(sceHttpSetRedirectCallback(1, nullptr, nullptr) == 0);
     Require(sceHttpSetCookieRecvCallback(1, nullptr, nullptr) == 0);
     int sslError = -1;
     std::uint32_t sslDetail = 0xFFFFFFFFu;
-    Require(sceHttpsGetSslError(1, &sslError, &sslDetail) == 0);
-    Require(sslError == 0 && sslDetail == 0);
+    Require(sceHttpsGetSslError(1, &sslError, &sslDetail) == invalidId);
+    Require(sslError == -1 && sslDetail == 0xFFFFFFFFu);
     Require(sceHttpsGetSslError(1, nullptr, &sslDetail) == invalidValue);
     Require(sceHttpsGetSslError(1, &sslError, nullptr) == invalidValue);
 

@@ -1,4 +1,7 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libSceSsl/SslTypes.hpp"
+#include "SslCertificateFixture.hpp"
+#include "HttpTlsFixture.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -35,6 +38,14 @@ int APS5_VABI sceHttpAbortRequest(int);
 int APS5_VABI sceHttpSetNonblock(int, int);
 int APS5_VABI sceHttpSetAutoRedirect(int, int);
 int APS5_VABI sceHttpSetInflateGZIPEnabled(int, int);
+int APS5_VABI sceHttpSetCookieEnabled(int, int);
+int APS5_VABI sceHttpSetChunkedTransferEnabled(int, int);
+int APS5_VABI sceHttpsLoadCert(int, int, SceSsl::Data**, SceSsl::Data*, SceSsl::Data*);
+int APS5_VABI sceHttpsUnloadCert(int);
+int APS5_VABI sceHttpsGetSslError(int, int*, std::uint32_t*);
+int APS5_VABI sceHttpsDisableOption(int, std::uint32_t);
+int APS5_VABI sceHttpsEnableOption(int, std::uint32_t);
+int APS5_VABI sceHttpsSetSslVersion(int, int);
 }
 
 static void Require(bool condition, const std::source_location location = std::source_location::current()) {
@@ -198,12 +209,12 @@ static void Failures(int connection) {
     Require(sceHttpCreateRequestWithURL2(connection, "GET", "file:///tmp/data", 0) == static_cast<int>(0x80433060));
     int secure = sceHttpCreateRequestWithURL2(connection, "GET", "https://127.0.0.1/", 0);
     Require(secure > 0);
-    Require(Unsupported([&] { sceHttpSendRequest(secure, nullptr, 0); }));
+    Require(sceHttpSendRequest(secure, nullptr, 0) == Network);
     Require(sceHttpDeleteRequest(secure) == 0);
     int request = Request(connection, "/headers");
     Require(Unsupported([&] { sceHttpSetNonblock(request, 1); }));
-    Require(Unsupported([&] { sceHttpSetAutoRedirect(request, 1); }));
-    Require(Unsupported([&] { sceHttpSetInflateGZIPEnabled(request, 1); }));
+    Require(sceHttpSetAutoRedirect(request, 1) == 0);
+    Require(sceHttpSetInflateGZIPEnabled(request, 1) == 0);
     Require(sceHttpSetResponseHeaderMaxSize(request, 64) == 0);
     Require(sceHttpSendRequest(request, nullptr, 0) < 0);
     Require(sceHttpDeleteRequest(request) == 0);
@@ -211,7 +222,7 @@ static void Failures(int connection) {
     Require(sceHttpSetRecvTimeOut(request, 50000) == 0);
     Require(sceHttpSendRequest(request, nullptr, 0) == Network);
     Require(sceHttpDeleteRequest(request) == 0);
-    for (const char* path : {"/truncated", "/badchunk"}) {
+    for (const char* path : {"/truncated", "/badchunk", "/badgzip"}) {
         request = Request(connection, path);
         int result = sceHttpSendRequest(request, nullptr, 0);
         char buffer[17];
@@ -222,6 +233,173 @@ static void Failures(int connection) {
         Require(result == Network);
         Require(sceHttpDeleteRequest(request) == 0);
     }
+}
+
+static void Session(int context, int connection, const char* url) {
+    int chunked = Request(connection, "/echo", "POST");
+    Require(sceHttpSetChunkedTransferEnabled(chunked, 1) == 0);
+    std::string upload(100000, 'A');
+    for (std::size_t index = 0; index < upload.size(); ++index) upload[index] = static_cast<char>(index % 251);
+    Require(sceHttpSendRequest(chunked, upload.data(), upload.size()) == 0);
+    Require(Read(chunked, 137) == upload);
+    Require(sceHttpDeleteRequest(chunked) == 0);
+    for (int code : {301, 302, 303, 307, 308}) {
+        const auto path = "/redirect/" + std::to_string(code);
+        const int request = Request(connection, path.c_str(), "POST", 7);
+        if (code != 302) Require(sceHttpSetAutoRedirect(request, 1) == 0);
+        Require(sceHttpSendRequest(request, "payload", 7) == 0);
+        Require(Read(request) == (code == 307 || code == 308 ? "POST:payload" : "GET:"));
+        int status = 0;
+        Require(sceHttpGetStatusCode(request, &status) == 0 && status == 200);
+        Require(sceHttpDeleteRequest(request) == 0);
+    }
+    int request = Request(connection, "/redirect/302");
+    Require(sceHttpSetAutoRedirect(request, 0) == 0);
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(Read(request) == "discard");
+    Require(sceHttpDeleteRequest(request) == 0);
+    request = Request(connection, "/loop");
+    Require(sceHttpSetAutoRedirect(request, 1) == 0);
+    Require(sceHttpSendRequest(request, nullptr, 0) == Network);
+    Require(sceHttpDeleteRequest(request) == 0);
+    for (const char* path : {"/gzip", "/deflate"}) {
+        request = Request(connection, path);
+        Require(sceHttpSetInflateGZIPEnabled(request, 1) == 0);
+        Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+        Require(Read(request, 3) == std::string("hello\0world", 11));
+        Require(sceHttpDeleteRequest(request) == 0);
+        request = Request(connection, path);
+        Require(sceHttpSetInflateGZIPEnabled(request, 0) == 0);
+        Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+        const auto encoded = Read(request, 3);
+        Require(encoded.size() > 11 && static_cast<unsigned char>(encoded[0]) == (std::strcmp(path, "/gzip") == 0 ? 0x1f : 0x78));
+        Require(sceHttpDeleteRequest(request) == 0);
+    }
+    Require(sceHttpSetCookieEnabled(connection, 1) == 0);
+    request = Request(connection, "/cookies/set");
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Read(request);
+    Require(sceHttpDeleteRequest(request) == 0);
+    request = Request(connection, "/cookies/check");
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(Read(request) == "session=alpha");
+    Require(sceHttpDeleteRequest(request) == 0);
+    std::vector<std::thread> readers;
+    for (int index = 0; index < 4; ++index) readers.emplace_back([&] {
+        const int current = Request(connection, "/cookies/check");
+        Require(sceHttpSendRequest(current, nullptr, 0) == 0);
+        Require(Read(current) == "session=alpha");
+        Require(sceHttpDeleteRequest(current) == 0);
+    });
+    for (auto& reader : readers) reader.join();
+    request = Request(connection, "/outside-cookie");
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(Read(request).empty());
+    Require(sceHttpDeleteRequest(request) == 0);
+    request = Request(connection, "/cookies/check");
+    Require(sceHttpSetCookieEnabled(request, 0) == 0);
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(Read(request).empty());
+    Require(sceHttpDeleteRequest(request) == 0);
+    const int isolated = sceHttpInit_nid_postfix(0, 0, 65536);
+    const int object = sceHttpCreateTemplate(isolated, "isolated", 2, 0);
+    const int other = sceHttpCreateConnectionWithURL(object, url, 0);
+    Require(sceHttpSetCookieEnabled(other, 1) == 0);
+    request = Request(other, "/cookies/check");
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(Read(request).empty());
+    Require(sceHttpTerm_nid_postfix(isolated) == 0);
+    Require(sceHttpSetCookieEnabled(context, 2) == InvalidValue);
+}
+
+static SceSsl::Data Certificate(const char* text) {
+    return {reinterpret_cast<std::uint8_t*>(const_cast<char*>(text)), std::strlen(text)};
+}
+
+static void Tls(int context, int connection, const char* url, bool mutual) {
+    Require(sceHttpsLoadCert(context, -1, nullptr, nullptr, nullptr) == InvalidValue);
+    Require(sceHttpsLoadCert(context, 1, nullptr, nullptr, nullptr) == InvalidValue);
+    SceSsl::Data empty{};
+    auto* invalid = &empty;
+    Require(sceHttpsLoadCert(context, 1, &invalid, nullptr, nullptr) == InvalidValue);
+    int request = Request(connection, "/binary");
+    Require(sceHttpSendRequest(request, nullptr, 0) == Network);
+    int error = 0;
+    std::uint32_t detail = 0;
+    Require(Unsupported([&] { sceHttpsGetSslError(request, &error, &detail); }));
+    Require(sceHttpDeleteRequest(request) == 0);
+    if (!mutual) {
+        request = Request(connection, "/binary");
+        Require(sceHttpsEnableOption(request, 0xa5) == 0);
+        Require(sceHttpsDisableOption(request, 0x20) == 0);
+        Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+        Require(Read(request).size() == 1024);
+        Require(sceHttpDeleteRequest(request) == 0);
+    }
+    auto authority = Certificate(RootPem);
+    if (!mutual) authority = {const_cast<std::uint8_t*>(RootDer.data()), RootDer.size()};
+    auto* pointer = &authority;
+    Require(sceHttpsLoadCert(context, 1, &pointer, nullptr, nullptr) == 0);
+    if (mutual) {
+        request = Request(connection, "/binary");
+        Require(sceHttpSendRequest(request, nullptr, 0) == Network);
+        Require(sceHttpDeleteRequest(request) == 0);
+        auto cert = Certificate(ClientPem);
+        auto key = Certificate(ClientKey);
+        auto wrong = Certificate(RootKey);
+        Require(sceHttpsLoadCert(context, 1, &pointer, &cert, &wrong) == InvalidValue);
+        Require(sceHttpsLoadCert(context, 1, &pointer, &cert, &key) == 0);
+    }
+    request = Request(connection, "/binary");
+    Require(sceHttpsSetSslVersion(request, 5) == 0);
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(Read(request).size() == 1024);
+    Require(sceHttpsGetSslError(request, &error, &detail) == 0 && error == 0 && detail == 0);
+    Require(sceHttpDeleteRequest(request) == 0);
+    if (mutual) {
+        SceSsl::Data cert{const_cast<std::uint8_t*>(ClientDer.data()), ClientDer.size()};
+        SceSsl::Data key{const_cast<std::uint8_t*>(ClientKeyDer.data()), ClientKeyDer.size()};
+        Require(sceHttpsLoadCert(context, 1, &pointer, &cert, &key) == 0);
+        request = Request(connection, "/binary");
+        Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+        Require(Read(request).size() == 1024);
+        Require(sceHttpDeleteRequest(request) == 0);
+    }
+    request = Request(connection, "/downgrade");
+    Require(sceHttpSendRequest(request, nullptr, 0) == Network);
+    Require(sceHttpDeleteRequest(request) == 0);
+    auto wrongHost = std::string(url);
+    wrongHost.replace(wrongHost.find("localhost"), 9, "127.0.0.1");
+    request = sceHttpCreateRequestWithURL2(connection, "GET", wrongHost.c_str(), 0);
+    Require(request > 0 && sceHttpSendRequest(request, nullptr, 0) == Network);
+    Require(Unsupported([&] { sceHttpsGetSslError(request, &error, &detail); }));
+    Require(sceHttpDeleteRequest(request) == 0);
+    request = sceHttpCreateRequestWithURL2(connection, "GET", wrongHost.c_str(), 0);
+    Require(sceHttpsDisableOption(request, 4) == 0);
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Read(request);
+    Require(sceHttpDeleteRequest(request) == 0);
+    Require(sceHttpsUnloadCert(context) == 0);
+    request = Request(connection, "/binary");
+    Require(sceHttpSendRequest(request, nullptr, 0) == Network);
+    Require(sceHttpDeleteRequest(request) == 0);
+}
+
+static void Expired(int context, int connection) {
+    auto authority = Certificate(RootPem);
+    auto* pointer = &authority;
+    Require(sceHttpsLoadCert(context, 1, &pointer, nullptr, nullptr) == 0);
+    int request = Request(connection, "/binary");
+    Require(sceHttpSendRequest(request, nullptr, 0) == Network);
+    int error = 0;
+    std::uint32_t detail = 0;
+    Require(Unsupported([&] { sceHttpsGetSslError(request, &error, &detail); }));
+    Require(sceHttpDeleteRequest(request) == 0);
+    request = Request(connection, "/binary");
+    Require(sceHttpsDisableOption(request, 8) == 0);
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(Read(request).size() == 1024);
+    Require(sceHttpDeleteRequest(request) == 0);
 }
 
 static void Lifecycle(int context, int connection) {
@@ -289,6 +467,9 @@ int main(int argc, char** argv) {
     if (mode == "basic") Basic(connection);
     else if (mode == "streaming") Streaming(connection);
     else if (mode == "failures") Failures(connection);
+    else if (mode == "session") Session(context, connection, argv[1]);
+    else if (mode == "tls" || mode == "mutual") Tls(context, connection, argv[1], mode == "mutual");
+    else if (mode == "expired") Expired(context, connection);
     else if (mode == "lifecycle") { Lifecycle(context, connection); return 0; }
     else if (mode == "contexts") { Contexts(context, connection, argv[1]); return 0; }
     else Require(false);

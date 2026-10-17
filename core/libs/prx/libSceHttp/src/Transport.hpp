@@ -7,5 +7,6 @@ void HttpContextStopped_nid_no_patch(int id);
 void HttpForgetCallback_nid_no_patch(int id);
 bool HttpHasCallback_nid_no_patch(int id);
 bool HttpHasObject_nid_no_patch(int id);
+bool HttpHasCertificates_nid_no_patch(int id);
 
 #endif

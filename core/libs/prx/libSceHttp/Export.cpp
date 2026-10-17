@@ -166,12 +166,6 @@ int APS5_VABI sceHttpInit_nid_postfix(int memid, int ssl_ctx_id, uint64_t pool_s
     return id;
 }
 
-int APS5_VABI sceHttpsDisableOption(int id, uint32_t ssl_flags) {
-    (void)id;
-    (void)ssl_flags;
-    return 0;
-}
-
 int APS5_VABI sceHttpSetAuthEnabled(int id, int enable) {
     if (HttpHasObject_nid_no_patch(id) && (enable != 0)) NotImplemented_nid_no_patch(__func__);
     (void)id;
@@ -184,13 +178,6 @@ int APS5_VABI sceHttpSetAuthInfoCallback(int id, HttpAuthInfoCallback callback, 
     (void)id;
     (void)callback;
     (void)userArg;
-    return 0;
-}
-
-int APS5_VABI sceHttpSetCookieEnabled(int id, int enable) {
-    (void)id;
-    if (static_cast<uint32_t>(enable) > 1) return ERROR_INVALID_VALUE;
-    if (enable != 0) NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
@@ -223,13 +210,8 @@ int APS5_VABI sceHttpSetSendTimeOut(int id, uint32_t usec) {
     return 0;
 }
 
-int APS5_VABI sceHttpsSetMinSslVersion(int id, uint32_t ssl_version) {
-    (void)id;
-    (void)ssl_version;
-    return 0;
-}
-
 int APS5_VABI sceHttpsSetSslCallback(int id, HttpsCallback cbfunc, void* user_arg) {
+    if (HttpHasObject_nid_no_patch(id) && cbfunc) NotImplemented_nid_no_patch(__func__);
     (void)id;
     (void)cbfunc;
     (void)user_arg;
@@ -279,21 +261,6 @@ int APS5_VABI sceHttpWaitRequest(HttpEpollHandle eh, HttpNBEvent* nbev, int maxe
 
 int APS5_VABI sceHttpRedirectCacheFlush(int http_ctx_id) {
     (void)http_ctx_id;
-    return 0;
-}
-
-int APS5_VABI sceHttpSetChunkedTransferEnabled(int id, int enable) {
-    if (HttpHasObject_nid_no_patch(id) && (enable != 0)) NotImplemented_nid_no_patch(__func__);
-    (void)id;
-    (void)enable;
-    return 0;
-}
-
-
-int APS5_VABI sceHttpSetInflateGZIPEnabled(int id, int enable) {
-    if (HttpHasObject_nid_no_patch(id) && (enable == 1)) NotImplemented_nid_no_patch(__func__);
-    (void)id;
-    if (static_cast<uint32_t>(enable) > 1) return ERROR_INVALID_VALUE;
     return 0;
 }
 
@@ -367,47 +334,11 @@ int APS5_VABI sceHttpParseResponseHeader(const char* header, std::size_t headerL
     return static_cast<int>(consumed);
 }
 
-int APS5_VABI sceHttpsEnableOption(int id, uint32_t ssl_flags) {
-    (void)id;
-    (void)ssl_flags;
-    return 0;
-}
-
-int APS5_VABI sceHttpsLoadCert(int http_ctx_id, int num, void* ca_list, void* cert, void* key) {
-    (void)http_ctx_id;
-    (void)num;
-    (void)ca_list;
-    (void)cert;
-    (void)key;
-    return 0;
-}
-
-int APS5_VABI sceHttpsUnloadCert(int http_ctx_id) {
-    (void)http_ctx_id;
-    return 0;
-}
-
-int APS5_VABI sceHttpsGetSslError(int id, int* err_num, uint32_t* detail) {
-    (void)id;
-    if (err_num == nullptr || detail == nullptr) {
-        return ERROR_INVALID_VALUE;
-    }
-    *err_num = 0;
-    *detail = 0;
-    return 0;
-}
-
 int APS5_VABI sceHttpSetCookieRecvCallback(int id, HttpCookieRecvCallback cbfunc, void* user_arg) {
     if (HttpHasObject_nid_no_patch(id) && (cbfunc != nullptr)) NotImplemented_nid_no_patch(__func__);
     (void)id;
     (void)cbfunc;
     (void)user_arg;
-    return 0;
-}
-
-int APS5_VABI sceHttpsSetSslVersion(int id, int ssl_version) {
-    (void)id;
-    (void)ssl_version;
     return 0;
 }
 
@@ -435,6 +366,7 @@ int APS5_VABI sceHttpAbortWaitRequest(HttpEpollHandle eh) {
 }
 
 int APS5_VABI sceHttpsGetCaList(int http_ctx_id, HttpsCaList* ca_list) {
+    if (HttpHasCertificates_nid_no_patch(http_ctx_id)) NotImplemented_nid_no_patch(__func__);
     (void)http_ctx_id;
     if (!ca_list) return ERROR_INVALID_VALUE;
     ca_list->certs = nullptr;

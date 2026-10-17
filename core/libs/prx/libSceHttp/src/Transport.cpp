@@ -1,7 +1,13 @@
 #include "Transport.hpp"
 #include "HttpErrors.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libSceSsl/SslTypes.hpp"
 #include <curl/curl.h>
+#include <mbedtls/ssl.h>
+#include <mbedtls/pem.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/platform_util.h>
 #include <algorithm>
 #include <atomic>
 #include <charconv>
@@ -28,7 +34,18 @@ struct Settings {
     std::size_t headerLimit = 16384;
     std::size_t readBlock = INT_MAX;
     bool keepAlive = false;
+    bool redirect = true;
+    bool cookies = false;
+    bool inflate = true;
+    bool chunked = false;
+    std::uint32_t verify = 0xfd;
+    long tlsVersion = CURL_SSLVERSION_TLSv1_2;
+    std::string authorities;
+    std::vector<unsigned char> certificate;
+    std::vector<unsigned char> key;
     std::vector<std::pair<std::string, std::string>> headers;
+
+    ~Settings() { if (!key.empty()) mbedtls_platform_zeroize(key.data(), key.size()); }
 };
 
 struct Transfer {
@@ -38,9 +55,13 @@ struct Transfer {
     bool attached = false;
     bool ready = false;
     bool done = false;
+    bool redirect = false;
+    bool location = false;
+    bool discard = false;
     int status = 0;
     int error = 0;
     int nativeError = 0;
+    std::uint32_t verifyError = 0;
     std::size_t headerLimit = 0;
     std::string headers;
     std::vector<char> body;
@@ -54,6 +75,28 @@ struct Transfer {
     }
 };
 
+struct CookieStore {
+    CURLSH* share = curl_share_init();
+    std::mutex mutex;
+
+    static void Lock(CURL*, curl_lock_data, curl_lock_access, void* value) {
+        static_cast<CookieStore*>(value)->mutex.lock();
+    }
+    static void Unlock(CURL*, curl_lock_data, void* value) {
+        static_cast<CookieStore*>(value)->mutex.unlock();
+    }
+    CookieStore() {
+        if (!share || curl_share_setopt(share, CURLSHOPT_LOCKFUNC, Lock) != CURLSHE_OK ||
+            curl_share_setopt(share, CURLSHOPT_UNLOCKFUNC, Unlock) != CURLSHE_OK ||
+            curl_share_setopt(share, CURLSHOPT_USERDATA, this) != CURLSHE_OK ||
+            curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_COOKIE) != CURLSHE_OK) {
+            if (share) curl_share_cleanup(share);
+            throw std::bad_alloc();
+        }
+    }
+    ~CookieStore() { curl_share_cleanup(share); }
+};
+
 struct Object {
     Kind kind;
     int parent = 0;
@@ -64,10 +107,34 @@ struct Object {
     std::uint64_t contentLength = 0;
     std::mutex mutex;
     std::atomic<bool> aborted{false};
+    std::shared_ptr<CookieStore> cookieStore;
+    std::shared_ptr<Object> root;
     std::unique_ptr<Transfer> transfer;
 
     explicit Object(Kind value) : kind(value) {}
 };
+
+struct ParsedCertificate {
+    mbedtls_x509_crt value{};
+    ~ParsedCertificate() { mbedtls_x509_crt_free(&value); }
+};
+
+int VerifyCertificate(void* argument, mbedtls_x509_crt*, int, std::uint32_t* flags) {
+    auto& request = *static_cast<Object*>(argument);
+    const auto options = request.settings.verify;
+    if (!(options & 0x01)) *flags = 0;
+    if (!(options & 0x04)) *flags &= ~MBEDTLS_X509_BADCERT_CN_MISMATCH;
+    if (!(options & 0x08)) *flags &= ~MBEDTLS_X509_BADCERT_EXPIRED;
+    if (!(options & 0x10)) *flags &= ~MBEDTLS_X509_BADCERT_FUTURE;
+    if (!(options & 0x20)) *flags &= ~MBEDTLS_X509_BADCERT_NOT_TRUSTED;
+    request.transfer->verifyError |= *flags;
+    return 0;
+}
+
+CURLcode ConfigureTls(CURL*, void* context, void* argument) {
+    mbedtls_ssl_conf_verify(static_cast<mbedtls_ssl_config*>(context), VerifyCertificate, argument);
+    return CURLE_OK;
+}
 
 std::mutex registryMutex;
 std::map<int, std::shared_ptr<Object>> registry;
@@ -92,6 +159,9 @@ std::shared_ptr<Object> FindAny(int id) {
 int Insert(std::shared_ptr<Object> object) {
     std::lock_guard lock(registryMutex);
     if (!registry.contains(object->parent)) return ERROR_INVALID_ID;
+    object->cookieStore = registry.at(object->parent)->cookieStore;
+    const auto& parent = registry.at(object->parent);
+    object->root = parent->kind == Kind::Context ? parent : parent->root;
     const int id = HttpNextHandle_nid_no_patch();
     registry.emplace(id, std::move(object));
     return id;
@@ -183,6 +253,8 @@ std::size_t Header(char* bytes, std::size_t size, std::size_t count, void* argum
         if (transfer.ready) return length;
         if (line.starts_with("HTTP/")) {
             transfer.headers.clear();
+            transfer.location = false;
+            transfer.discard = false;
             const auto space = line.find(' ');
             if (space == std::string_view::npos || line.size() - space < 4) return 0;
             const auto parsed = std::from_chars(line.data() + space + 1, line.data() + space + 4, transfer.status);
@@ -193,7 +265,12 @@ std::size_t Header(char* bytes, std::size_t size, std::size_t count, void* argum
             return 0;
         }
         transfer.headers.append(bytes, length);
-        if (line == "\r\n" && transfer.status >= 200) transfer.ready = true;
+        if (line.size() >= 9 && EqualName(line.substr(0, 9), "Location:")) transfer.location = true;
+        if (line == "\r\n" && transfer.status >= 200) {
+            transfer.discard = transfer.redirect && transfer.location &&
+                (transfer.status == 301 || transfer.status == 302 || transfer.status == 303 || transfer.status == 307 || transfer.status == 308);
+            transfer.ready = !transfer.discard;
+        }
         return length;
     } catch (...) {
         transfer.error = ERROR_OUT_OF_MEMORY;
@@ -203,6 +280,7 @@ std::size_t Header(char* bytes, std::size_t size, std::size_t count, void* argum
 
 std::size_t Body(char* bytes, std::size_t size, std::size_t count, void* argument) noexcept {
     auto& transfer = *static_cast<Transfer*>(argument);
+    if (transfer.discard) return size * count;
     if (transfer.consumed != transfer.body.size()) return CURL_WRITEFUNC_PAUSE;
     try {
         transfer.body.assign(bytes, bytes + size * count);
@@ -267,13 +345,22 @@ int Configure(int id, TFunction function) {
 }
 
 void HttpContextStarted_nid_no_patch(int id) {
+    if (!InitializeCurl()) throw std::runtime_error("HTTP backend initialization failed");
     auto object = std::make_shared<Object>(Kind::Context);
+    object->cookieStore = std::make_shared<CookieStore>();
     object->context = id;
     std::lock_guard lock(registryMutex);
     registry.emplace(id, std::move(object));
 }
 
 bool HttpHasObject_nid_no_patch(int id) { return FindAny(id) != nullptr; }
+
+bool HttpHasCertificates_nid_no_patch(int id) {
+    auto context = Find(id, Kind::Context);
+    if (!context) return false;
+    std::lock_guard lock(context->mutex);
+    return !context->settings.authorities.empty();
+}
 
 void HttpContextStopped_nid_no_patch(int id) {
     std::vector<std::shared_ptr<Object>> removed;
@@ -296,7 +383,7 @@ int APS5_VABI sceHttpCreateTemplate(int context, const char* agent, int version,
     auto parent = Find(context, Kind::Context);
     if (!parent) return ERROR_INVALID_ID;
     if ((version != 1 && version != 2) || !agent || !Field(agent)) return ERROR_INVALID_VALUE;
-    if (proxy) NotImplemented_nid_no_patch("HTTP automatic proxy configuration");
+    if (proxy) NotImplemented_nid_no_patch(__func__);
     auto object = std::make_shared<Object>(Kind::Template);
     std::lock_guard lock(parent->mutex);
     object->settings = parent->settings;
@@ -350,7 +437,7 @@ int APS5_VABI sceHttpDeleteRequest(int id) { return Delete(id, Kind::Request); }
 int APS5_VABI sceHttpAddRequestHeader(int id, const char* name, const char* value, std::uint32_t mode) {
     if (!name || !value || !Token(name) || !Field(value) || mode > 1) return ERROR_INVALID_VALUE;
     if (EqualName(name, "Content-Length") || EqualName(name, "Transfer-Encoding"))
-        NotImplemented_nid_no_patch("HTTP manual framing headers");
+        NotImplemented_nid_no_patch(__func__);
     return Configure(id, [&](Object& object) {
         auto& headers = object.settings.headers;
         if (mode == 0) std::erase_if(headers, [&](const auto& header) { return EqualName(header.first, name); });
@@ -384,12 +471,127 @@ int APS5_VABI sceHttpSetRequestContentLength(int id, std::uint64_t length) {
 }
 int APS5_VABI sceHttpSetNonblock(int id, int enabled) {
     if (!FindAny(id)) return ERROR_INVALID_ID;
-    if (enabled != 0) NotImplemented_nid_no_patch("HTTP asynchronous requests");
+    if (enabled != 0) NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 int APS5_VABI sceHttpSetAutoRedirect(int id, int enabled) {
-    if (!FindAny(id)) return ERROR_INVALID_ID;
-    if (enabled != 0) NotImplemented_nid_no_patch("HTTP automatic redirects");
+    if (enabled != 0 && enabled != 1) return ERROR_INVALID_VALUE;
+    return Configure(id, [&](Object& object) { object.settings.redirect = enabled; return 0; });
+}
+
+int APS5_VABI sceHttpSetCookieEnabled(int id, int enabled) {
+    if (enabled != 0 && enabled != 1) return ERROR_INVALID_VALUE;
+    return Configure(id, [&](Object& object) { object.settings.cookies = enabled; return 0; });
+}
+
+int APS5_VABI sceHttpSetInflateGZIPEnabled(int id, int enabled) {
+    if (enabled != 0 && enabled != 1) return ERROR_INVALID_VALUE;
+    return Configure(id, [&](Object& object) { object.settings.inflate = enabled; return 0; });
+}
+
+int APS5_VABI sceHttpSetChunkedTransferEnabled(int id, int enabled) {
+    if (enabled != 0 && enabled != 1) return ERROR_INVALID_VALUE;
+    return Configure(id, [&](Object& object) { object.settings.chunked = enabled; return 0; });
+}
+
+int APS5_VABI sceHttpsEnableOption(int id, std::uint32_t flags) {
+    if (flags & ~0xfdU) NotImplemented_nid_no_patch(__func__);
+    return Configure(id, [&](Object& object) { object.settings.verify |= flags; return 0; });
+}
+
+int APS5_VABI sceHttpsDisableOption(int id, std::uint32_t flags) {
+    if (flags & ~0x7dU) NotImplemented_nid_no_patch(__func__);
+    return Configure(id, [&](Object& object) { object.settings.verify &= ~flags; return 0; });
+}
+
+int APS5_VABI sceHttpsSetMinSslVersion(int id, std::uint32_t version) {
+    if (version != 0 && version != 5) NotImplemented_nid_no_patch(__func__);
+    return Configure(id, [&](Object& object) { object.settings.tlsVersion = CURL_SSLVERSION_TLSv1_2; return 0; });
+}
+
+int APS5_VABI sceHttpsSetSslVersion(int id, int version) {
+    if (version != 0 && version != 5) NotImplemented_nid_no_patch(__func__);
+    return Configure(id, [&](Object& object) {
+        object.settings.tlsVersion = CURL_SSLVERSION_TLSv1_2 | (version == 5 ? CURL_SSLVERSION_MAX_TLSv1_2 : 0);
+        return 0;
+    });
+}
+
+int APS5_VABI sceHttpsLoadCert(int id, int count, SceSsl::Data** authorities, SceSsl::Data* certificate, SceSsl::Data* key) {
+    if (count < 0 || (count && !authorities) || (!!certificate != !!key)) return ERROR_INVALID_VALUE;
+    auto context = Find(id, Kind::Context);
+    if (!context) return ERROR_INVALID_ID;
+    const auto copy = [](const SceSsl::Data* data) {
+        if (!data || !data->ptr || !data->size || data->size > INT_MAX) return std::vector<unsigned char>{};
+        std::vector<unsigned char> bytes(data->ptr, data->ptr + data->size);
+        if (bytes.front() != 0x30 && bytes.back() != 0) bytes.push_back(0);
+        return bytes;
+    };
+    std::string pem;
+    for (int index = 0; index < count; ++index) {
+        const auto bytes = copy(authorities[index]);
+        if (bytes.empty()) return ERROR_INVALID_VALUE;
+        ParsedCertificate chain;
+        if (mbedtls_x509_crt_parse(&chain.value, bytes.data(), bytes.size()) != 0) return ERROR_INVALID_VALUE;
+        for (auto* entry = &chain.value; entry && entry->raw.p; entry = entry->next) {
+            std::size_t length = 0;
+            mbedtls_pem_write_buffer("-----BEGIN CERTIFICATE-----\n", "-----END CERTIFICATE-----\n",
+                entry->raw.p, entry->raw.len, nullptr, 0, &length);
+            std::vector<unsigned char> encoded(length);
+            if (mbedtls_pem_write_buffer("-----BEGIN CERTIFICATE-----\n", "-----END CERTIFICATE-----\n",
+                entry->raw.p, entry->raw.len, encoded.data(), encoded.size(), &length) != 0) return ERROR_INVALID_VALUE;
+            pem.append(reinterpret_cast<char*>(encoded.data()), length - 1);
+        }
+    }
+    auto certBytes = certificate ? copy(certificate) : std::vector<unsigned char>{};
+    auto keyBytes = key ? copy(key) : std::vector<unsigned char>{};
+    if (certificate) {
+        if (certBytes.empty() || keyBytes.empty()) return ERROR_INVALID_VALUE;
+        ParsedCertificate parsed;
+        if (mbedtls_x509_crt_parse(&parsed.value, certBytes.data(), certBytes.size()) != 0) return ERROR_INVALID_VALUE;
+        mbedtls_pk_context privateKey;
+        mbedtls_pk_init(&privateKey);
+        mbedtls_entropy_context entropy;
+        mbedtls_entropy_init(&entropy);
+        mbedtls_ctr_drbg_context random;
+        mbedtls_ctr_drbg_init(&random);
+        int result = mbedtls_ctr_drbg_seed(&random, mbedtls_entropy_func, &entropy, nullptr, 0);
+        if (!result) result = mbedtls_pk_parse_key(&privateKey, keyBytes.data(), keyBytes.size(), nullptr, 0,
+            mbedtls_ctr_drbg_random, &random);
+        if (!result) result = mbedtls_pk_check_pair(&parsed.value.pk, &privateKey, mbedtls_ctr_drbg_random, &random);
+        mbedtls_pk_free(&privateKey);
+        mbedtls_ctr_drbg_free(&random);
+        mbedtls_entropy_free(&entropy);
+        if (result) return ERROR_INVALID_VALUE;
+    }
+    std::lock_guard lock(context->mutex);
+    if (!context->settings.key.empty()) mbedtls_platform_zeroize(context->settings.key.data(), context->settings.key.size());
+    context->settings.authorities = std::move(pem);
+    context->settings.certificate = std::move(certBytes);
+    context->settings.key = std::move(keyBytes);
+    return 0;
+}
+
+int APS5_VABI sceHttpsUnloadCert(int id) {
+    if (!Find(id, Kind::Context)) return ERROR_INVALID_ID;
+    return Configure(id, [](Object& object) {
+        object.settings.authorities.clear();
+        object.settings.certificate.clear();
+        if (!object.settings.key.empty()) mbedtls_platform_zeroize(object.settings.key.data(), object.settings.key.size());
+        object.settings.key.clear();
+        return 0;
+    });
+}
+
+int APS5_VABI sceHttpsGetSslError(int id, int* error, std::uint32_t* detail) {
+    if (!error || !detail) return ERROR_INVALID_VALUE;
+    auto request = Find(id, Kind::Request);
+    if (!request) return ERROR_INVALID_ID;
+    std::lock_guard lock(request->mutex);
+    if (request->transfer && (request->transfer->nativeError || request->transfer->verifyError))
+        NotImplemented_nid_no_patch(__func__);
+    *error = 0;
+    *detail = 0;
     return 0;
 }
 
@@ -399,20 +601,53 @@ int APS5_VABI sceHttpSendRequest(int id, const void* data, std::size_t size) {
     std::lock_guard lock(request->mutex);
     if (request->aborted) return ERROR_ABORTED;
     if (request->transfer) return ERROR_INVALID_VALUE;
-    if ((!data && size) || size != request->contentLength || size > INT64_MAX) return ERROR_INVALID_VALUE;
-    if (request->url.starts_with("https:")) NotImplemented_nid_no_patch("HTTP TLS transport");
-    if (HasCallbacks(id)) NotImplemented_nid_no_patch("HTTP request status callbacks during transport");
+    if ((!data && size) || (!request->settings.chunked && size != request->contentLength) || size > INT64_MAX) return ERROR_INVALID_VALUE;
+    {
+        std::lock_guard contextLock(request->root->mutex);
+        request->settings.authorities = request->root->settings.authorities;
+        request->settings.certificate = request->root->settings.certificate;
+        if (!request->settings.key.empty()) mbedtls_platform_zeroize(request->settings.key.data(), request->settings.key.size());
+        request->settings.key = request->root->settings.key;
+    }
+    if (HasCallbacks(id)) NotImplemented_nid_no_patch(__func__);
     if ((request->method == "GET" || request->method == "HEAD") && size) return ERROR_INVALID_VALUE;
     if (!InitializeCurl()) return ERROR_NETWORK;
     request->transfer = std::make_unique<Transfer>();
     auto& transfer = *request->transfer;
     if (!transfer.easy || !transfer.multi) return transfer.error = ERROR_OUT_OF_MEMORY;
     transfer.headerLimit = request->settings.headerLimit;
+    transfer.redirect = request->settings.redirect;
     const auto set = [&](CURLoption option, auto value) {
         if (curl_easy_setopt(transfer.easy, option, value) != CURLE_OK) throw std::runtime_error("HTTP curl option configuration failed");
     };
     set(CURLOPT_URL, request->url.c_str());
-    set(CURLOPT_PROTOCOLS_STR, "http");
+    set(CURLOPT_PROTOCOLS_STR, "http,https");
+    set(CURLOPT_REDIR_PROTOCOLS_STR, request->url.starts_with("https:") ? "https" : "http,https");
+    set(CURLOPT_FOLLOWLOCATION, request->settings.redirect ? CURLFOLLOW_OBEYCODE : 0L);
+    set(CURLOPT_MAXREDIRS, 10L);
+    set(CURLOPT_SSL_VERIFYPEER, (request->settings.verify & 1) ? 1L : 0L);
+    set(CURLOPT_SSL_VERIFYHOST, (request->settings.verify & 4) ? 2L : 0L);
+    set(CURLOPT_SSLVERSION, request->settings.tlsVersion);
+    set(CURLOPT_SSL_SESSIONID_CACHE, (request->settings.verify & 0x40) ? 1L : 0L);
+    set(CURLOPT_SSL_CTX_FUNCTION, ConfigureTls);
+    set(CURLOPT_SSL_CTX_DATA, request.get());
+    if (!request->settings.authorities.empty()) {
+        curl_blob blob{request->settings.authorities.data(), request->settings.authorities.size() + 1, CURL_BLOB_COPY};
+        set(CURLOPT_CAINFO_BLOB, &blob);
+    }
+    if (!request->settings.certificate.empty()) {
+        curl_blob cert{request->settings.certificate.data(), request->settings.certificate.size(), CURL_BLOB_COPY};
+        curl_blob key{request->settings.key.data(), request->settings.key.size(), CURL_BLOB_COPY};
+        set(CURLOPT_SSLCERTTYPE, request->settings.certificate.front() == 0x30 ? "DER" : "PEM");
+        set(CURLOPT_SSLKEYTYPE, request->settings.key.front() == 0x30 ? "DER" : "PEM");
+        set(CURLOPT_SSLCERT_BLOB, &cert);
+        set(CURLOPT_SSLKEY_BLOB, &key);
+    }
+    if (request->settings.cookies) {
+        set(CURLOPT_SHARE, request->cookieStore->share);
+        set(CURLOPT_COOKIEFILE, "");
+    }
+    if (request->settings.inflate) set(CURLOPT_ACCEPT_ENCODING, "gzip,deflate");
     set(CURLOPT_PROXY, "");
     set(CURLOPT_NOSIGNAL, 1L);
     set(CURLOPT_FORBID_REUSE, request->settings.keepAlive ? 0L : 1L);
@@ -425,7 +660,7 @@ int APS5_VABI sceHttpSendRequest(int id, const void* data, std::size_t size) {
     set(CURLOPT_WRITEDATA, &transfer);
     set(CURLOPT_CUSTOMREQUEST, request->method.c_str());
     if (request->method == "HEAD") set(CURLOPT_NOBODY, 1L);
-    else if (size || request->method == "POST" || request->method == "PUT") {
+    else if (size || request->settings.chunked || request->method == "POST" || request->method == "PUT") {
         set(CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(size));
         set(CURLOPT_COPYPOSTFIELDS, size ? data : "");
     }
@@ -435,6 +670,7 @@ int APS5_VABI sceHttpSendRequest(int id, const void* data, std::size_t size) {
         transfer.outgoing = next;
     };
     append("Expect:");
+    if (request->settings.chunked) append("Transfer-Encoding: chunked");
     if (!request->settings.keepAlive) append("Connection: close");
     for (const auto& [name, value] : request->settings.headers) append(name + (value.empty() ? ";" : ": " + value));
     set(CURLOPT_HTTPHEADER, transfer.outgoing);
