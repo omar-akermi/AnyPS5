@@ -691,8 +691,11 @@ static void CheckKernelStatusFlags() {
 }
 
 static void CheckAddressText(int family, const char* text) {
-    std::array<std::uint8_t, 16> address{};
+    std::array<std::uint8_t, 32> address;
+    address.fill(0xa5);
     Require(sceNetInetPton(family, text, address.data()) == 1);
+    const auto addressSize = family == 2 ? 4 : 16;
+    Require(std::all_of(address.begin() + addressSize, address.end(), [](auto byte) { return byte == 0xa5; }));
     std::array<char, 64> output{};
     const auto length = static_cast<std::uint32_t>(std::strlen(text));
     for (std::uint32_t size = 0; size <= length; ++size) {
@@ -708,6 +711,22 @@ static void CheckAddressText(int family, const char* text) {
     Require(sceNetInetNtop(99, address.data(), output.data(), output.size()) == nullptr && *sceNetErrnoLoc() == 47);
     Require(sceNetInetNtop(family, nullptr, output.data(), output.size()) == nullptr && *sceNetErrnoLoc() == 22);
     Require(sceNetInetNtop(family, address.data(), nullptr, output.size()) == nullptr && *sceNetErrnoLoc() == 22);
+}
+
+static void CheckInvalidAddressText() {
+    for (int family : {2, 28}) {
+        for (const char* text : {"1.2.3.4 ", "1.2.3.4\n", "1.2.3.4x", "1.2.3.4.5", "256.2.3.4",
+                 "::ffff:192.0.2.1 ", "::ffff:192.0.2.1x", "1::2::3", "not-an-address", ""}) {
+            std::array<std::uint8_t, 32> address;
+            address.fill(0xa5);
+            const auto original = address;
+            *sceNetErrnoLoc() = 123;
+            Require(sceNetInetPton(family, text, address.data()) == 0);
+            if (address != original) std::fprintf(stderr, "sceNetInetPton(%d, \"%s\") changed the destination on failure\n", family, text);
+            Require(address == original);
+            Require(*sceNetErrnoLoc() == 123);
+        }
+    }
 }
 
 static void CheckEpollIdent() {
@@ -1050,6 +1069,7 @@ int main() {
     CheckAddressText(2, "255.255.255.255");
     CheckAddressText(28, "::1");
     CheckAddressText(28, "1234:5678:9abc:def0:1234:5678:9abc:def0");
+    CheckInvalidAddressText();
     CheckEpollIdent();
     CheckLinkLocalAllNodesIpv6();
     CheckUnboundSocketName();

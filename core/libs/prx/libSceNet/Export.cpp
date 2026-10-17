@@ -1492,11 +1492,14 @@ int APS5_VABI sceNetInetPton(int af, const char* src, void* dst) {
     if (af != NET_AF_INET && af != NET_AF_INET6) {
         return fail(NET_EAFNOSUPPORT);
     }
+    alignas(std::uint32_t) std::array<std::uint8_t, 16> address{};
 #ifdef _WIN32
-    return InetPtonA(af == NET_AF_INET ? AF_INET : AF_INET6, src, dst);
+    const int result = InetPtonA(af == NET_AF_INET ? AF_INET : AF_INET6, src, address.data());
 #else
-    return ::inet_pton(af == NET_AF_INET ? AF_INET : AF_INET6, src, dst);
+    const int result = ::inet_pton(af == NET_AF_INET ? AF_INET : AF_INET6, src, address.data());
 #endif
+    if (result == 1) std::memcpy(dst, address.data(), af == NET_AF_INET ? 4 : 16);
+    return result;
 }
 
 const char* APS5_VABI sceNetInetNtop(int af, const void* src, char* dst, uint32_t size) {
