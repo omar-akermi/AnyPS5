@@ -1,4 +1,7 @@
 import http.server
+import base64
+import hashlib
+import hmac
 import gzip
 import os
 import re
@@ -9,6 +12,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import urllib.request
 import zlib
 from pathlib import Path
 
@@ -35,6 +39,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     do_TRACE = do_POST
 
     def do_CONNECT(self):
+        if self.path.startswith("authenticated.invalid:") and self.headers.get("Proxy-Authorization") != "Basic Z3Vlc3Q6c2VjcmV0":
+            self.send_response(407)
+            self.send_header("Proxy-Authenticate", 'Basic realm="proxy"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            self.close_connection = True
+            return
         if self.path.startswith("rejected.invalid:"):
             self.send_error(403)
             return
@@ -65,8 +76,93 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if self.rfile.read(2) != b"\r\n":
                 raise ValueError("invalid chunk framing")
 
+    def authenticate(self):
+        parts = urllib.parse.urlsplit(self.path)
+        options = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
+        realm = options.get("realm", ["test realm"])[0]
+        algorithm = options.get("algorithm", ["MD5"])[0]
+        quality = options.get("qop", ["auth"])[0]
+        userhash = options.get("userhash", ["false"])[0] == "true"
+        body = self.upload()
+        header = self.headers.get("Authorization", "")
+        nonce = "fixture-nonce"
+        accepted = False
+        if parts.path in ("/auth/basic", "/auth/basic-redirect", "/auth/multiple") and header.startswith("Basic "):
+            try:
+                accepted = base64.b64decode(header[6:], validate=True) == b"guest:secret"
+            except ValueError:
+                pass
+        elif parts.path in ("/auth/digest", "/auth/stale", "/auth/multiple") and header.startswith("Digest "):
+            try:
+                values = urllib.request.parse_keqv_list(urllib.request.parse_http_list(header[7:]))
+                if parts.path == "/auth/stale" and values.get("nonce") == nonce:
+                    nonce = "replacement-nonce"
+                elif parts.path == "/auth/stale":
+                    nonce = "replacement-nonce"
+                name = "sha256" if algorithm.lower().startswith("sha-256") else "md5"
+                digest = lambda value: hashlib.new(name, value).hexdigest()
+                a1 = digest(f"guest:{realm}:secret".encode())
+                if algorithm.lower().endswith("-sess"):
+                    a1 = digest(f"{a1}:{nonce}:{values['cnonce']}".encode())
+                a2 = f"{self.command}:{self.path}"
+                if quality == "auth-int":
+                    a2 += ":" + digest(body)
+                a2 = digest(a2.encode())
+                response = f"{a1}:{nonce}:"
+                if quality:
+                    response += f"{values['nc']}:{values['cnonce']}:{values['qop']}:"
+                response = digest((response + a2).encode())
+                accepted = (values.get("username") == (digest(f"guest:{realm}".encode()) if userhash else "guest") and
+                            values.get("realm") == realm and values.get("nonce") == nonce and values.get("uri") == self.path and
+                            hmac.compare_digest(values.get("response", ""), response) and
+                            (not quality or (values.get("qop") == quality and len(values.get("nc", "")) == 8 and
+                                             int(values["nc"], 16) > 0 and len(values.get("cnonce", "")) >= 16)))
+            except (KeyError, ValueError):
+                pass
+        if accepted:
+            if parts.path == "/auth/basic-redirect":
+                self.send_response(302)
+                self.send_header("Location", f"http://localhost:{self.server.server_port}/auth/basic")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            data = b"authenticated:" + body
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(data)
+            return
+        self.send_response(401)
+        quoted = realm.replace("\\", "\\\\").replace('"', '\\"')
+        if parts.path in ("/auth/basic", "/auth/basic-redirect"):
+            challenge = f'Basic realm="{quoted}"'
+            if "extraqop" in options:
+                challenge += f', qop="{options["extraqop"][0]}"'
+        else:
+            challenge = f'Digest realm="{quoted}", nonce="{nonce}", algorithm={algorithm}, opaque="fixture-token"'
+            if quality:
+                challenge += f', qop="{quality}"'
+            if userhash:
+                challenge += ", userhash=true"
+            if parts.path == "/auth/stale" and nonce == "replacement-nonce":
+                challenge += ", stale=true"
+        if parts.path == "/auth/multiple":
+            self.send_header("WWW-Authenticate", 'Negotiate ignored-token, Basic realm="fallback"')
+        if parts.path == "/auth/malformed":
+            challenge = 'Digest realm="unterminated'
+        self.send_header("WWW-Authenticate", challenge)
+        data = b"authentication-required"
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
     def respond(self):
         try:
+            if self.path.startswith("/auth/"):
+                self.authenticate()
+                return
             if self.path == "/stall-upload":
                 self.server.upload_release.wait(3)
             if self.path == "/release-upload":
@@ -183,7 +279,7 @@ if __name__ == "__main__":
 
     server = FixtureServer(("127.0.0.1", 0), Handler)
     server.upload_release = threading.Event()
-    secure = sys.argv[2] in ("tls", "mutual", "expired", "async_tls", "tunnel_tls", "verification", "sni", "minimum12", "minimum13", "status_tls", "redirect_callbacks_tls")
+    secure = sys.argv[2] in ("tls", "mutual", "expired", "async_tls", "tunnel_tls", "verification", "sni", "minimum12", "minimum13", "status_tls", "redirect_callbacks_tls", "auth_basic_tls", "auth_digest_tls")
     if secure:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_3 if sys.argv[2] == "minimum13" else ssl.TLSVersion.TLSv1_2

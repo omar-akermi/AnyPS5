@@ -1,5 +1,6 @@
 #include "Transport.hpp"
 #include "HttpErrors.hpp"
+#include "Authentication.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceSsl/SslTypes.hpp"
 #include <curl/curl.h>
@@ -9,6 +10,7 @@
 #include <mbedtls/entropy.h>
 #include <mbedtls/platform_util.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -17,6 +19,7 @@
 #include <cstring>
 #include <exception>
 #include <map>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -62,6 +65,13 @@ struct Settings {
     void* cookieArgument = nullptr;
     HttpRedirectCallback redirectCallback = nullptr;
     void* redirectArgument = nullptr;
+    bool authEnabled = true;
+    HttpAuthInfoCallback authCallback = nullptr;
+    void* authArgument = nullptr;
+    bool urlCredentials = false;
+    std::string credentialOrigin;
+    std::string username;
+    std::string password;
     std::shared_ptr<HttpEventSink> epoll;
     HttpEpollHandle epollHandle = nullptr;
     void* epollArgument = nullptr;
@@ -73,7 +83,10 @@ struct Settings {
     std::vector<unsigned char> key;
     std::vector<std::pair<std::string, std::string>> headers;
 
-    ~Settings() { if (!key.empty()) mbedtls_platform_zeroize(key.data(), key.size()); }
+    ~Settings() {
+        if (!key.empty()) mbedtls_platform_zeroize(key.data(), key.size());
+        if (!password.empty()) mbedtls_platform_zeroize(password.data(), password.size());
+    }
 };
 
 struct Object;
@@ -96,11 +109,22 @@ struct Transfer {
     bool done = false;
     bool redirect = false;
     bool manualRedirect = false;
+    bool manualAuth = false;
+    bool pendingAuthentication = false;
+    bool pendingProxyAuth = false;
+    bool authorizationAdded = false;
+    bool proxyAuthorizationAdded = false;
+    int authAttempts = 0;
+    std::string pendingAuthorization;
+    std::vector<HttpAuthChallenge> authChallenges;
+    std::vector<HttpAuthChallenge> proxyChallenges;
+    std::map<std::string, std::uint32_t> nonceCounters;
     bool connectOnly = false;
     int redirects = 0;
     std::string currentUrl;
     std::string currentMethod;
     std::string defaultProxy;
+    std::string proxyUrl;
     std::string redirectLocation;
     std::string pendingUrl;
     std::string pendingMethod;
@@ -162,6 +186,16 @@ struct CookieStore {
     ~CookieStore() { curl_share_cleanup(share); }
 };
 
+struct AuthCredential {
+    std::string origin;
+    std::string realm;
+    int type;
+    bool proxy;
+    std::string username;
+    std::string password;
+    ~AuthCredential() { if (!password.empty()) mbedtls_platform_zeroize(password.data(), password.size()); }
+};
+
 struct Object {
     Kind kind;
     int id = 0;
@@ -175,6 +209,8 @@ struct Object {
     std::string proxy;
     std::uint64_t contentLength = 0;
     std::recursive_mutex mutex;
+    std::mutex authMutex;
+    std::list<AuthCredential> credentials;
     std::atomic<unsigned> callbacks{0};
     std::atomic<bool> aborted{false};
     std::shared_ptr<CookieStore> cookieStore;
@@ -425,21 +461,48 @@ int Framing(const Object& request, std::size_t size, bool& chunked, bool& length
 std::string NormalizeUrl(const char* text, bool originOnly) {
     if (!text || !InitializeCurl()) return {};
     std::unique_ptr<CURLU, decltype(&curl_url_cleanup)> url(curl_url(), curl_url_cleanup);
-    if (!url || curl_url_set(url.get(), CURLUPART_URL, text, CURLU_DISALLOW_USER | CURLU_NON_SUPPORT_SCHEME) != CURLUE_OK) return {};
+    if (!url || curl_url_set(url.get(), CURLUPART_URL, text, CURLU_NON_SUPPORT_SCHEME) != CURLUE_OK) return {};
     char* value = nullptr;
     if (curl_url_get(url.get(), CURLUPART_SCHEME, &value, 0) != CURLUE_OK) return {};
     const std::string scheme(value);
     curl_free(value);
     if (scheme != "http" && scheme != "https") return {};
+    if (curl_url_get(url.get(), CURLUPART_HOST, &value, 0) != CURLUE_OK) return {};
+    std::string host(value);
+    curl_free(value);
+    for (char& c : host) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    if (curl_url_set(url.get(), CURLUPART_HOST, host.c_str(), 0) != CURLUE_OK) return {};
+    curl_url_set(url.get(), CURLUPART_USER, nullptr, 0);
+    curl_url_set(url.get(), CURLUPART_PASSWORD, nullptr, 0);
     curl_url_set(url.get(), CURLUPART_FRAGMENT, nullptr, 0);
     if (originOnly) {
         curl_url_set(url.get(), CURLUPART_PATH, "/", 0);
         curl_url_set(url.get(), CURLUPART_QUERY, nullptr, 0);
     }
-    if (curl_url_get(url.get(), CURLUPART_URL, &value, 0) != CURLUE_OK) return {};
+    if (curl_url_get(url.get(), CURLUPART_URL, &value, originOnly ? CURLU_NO_DEFAULT_PORT : 0) != CURLUE_OK) return {};
     std::string result(value);
     curl_free(value);
     return result;
+}
+
+bool UrlCredentials(const char* text, Settings& settings) {
+    std::unique_ptr<CURLU, decltype(&curl_url_cleanup)> url(curl_url(), curl_url_cleanup);
+    if (!url || curl_url_set(url.get(), CURLUPART_URL, text, 0) != CURLUE_OK) return false;
+    char* user = nullptr;
+    const auto result = curl_url_get(url.get(), CURLUPART_USER, &user, CURLU_URLDECODE);
+    if (result == CURLUE_NO_USER) return true;
+    if (result != CURLUE_OK) return false;
+    settings.username = user;
+    curl_free(user);
+    char* password = nullptr;
+    const auto key = curl_url_get(url.get(), CURLUPART_PASSWORD, &password, CURLU_URLDECODE);
+    if (key != CURLUE_OK && key != CURLUE_NO_PASSWORD) return false;
+    if (!settings.password.empty()) mbedtls_platform_zeroize(settings.password.data(), settings.password.size());
+    settings.password = password ? password : "";
+    if (password) { mbedtls_platform_zeroize(password, std::strlen(password)); curl_free(password); }
+    settings.urlCredentials = true;
+    settings.credentialOrigin = NormalizeUrl(text, true);
+    return true;
 }
 
 const char* Method(int method) {
@@ -458,6 +521,7 @@ int ProxyConfiguration(std::string& proxy) {
     const auto* end = static_cast<const std::uint8_t*>(std::memchr(info.opaque, 0, sizeof(info.opaque)));
     if (!end || end == info.opaque) return ERROR_INVALID_VALUE;
     std::string host(reinterpret_cast<const char*>(info.opaque), static_cast<std::size_t>(end - info.opaque));
+    if (host.find_first_of("/?#@\\") != std::string::npos) return ERROR_INVALID_VALUE;
     if (host.find(':') != std::string::npos && !host.starts_with('[')) host = '[' + host + ']';
     if (sceNetCtlGetInfo(21, &info) != 0) return ERROR_NETWORK;
     std::uint16_t port = 0;
@@ -493,6 +557,7 @@ int NewRequest(int connection, const char* method, const char* location, std::ui
     {
         std::lock_guard lock(parent->mutex);
         request->settings = parent->settings;
+        if (absolute && !UrlCredentials(location, request->settings)) return ERROR_INVALID_URL;
         request->context = parent->context;
         if (EqualName(method, "CONNECT")) {
             if (length) return ERROR_INVALID_VALUE;
@@ -511,15 +576,138 @@ int NewRequest(int connection, const char* method, const char* location, std::ui
     return Insert(std::move(request));
 }
 
-std::string RedirectUrl(const std::string& current, const std::string& location) {
+std::string RedirectUrl(const std::string& current, const std::string& location, Settings* settings = nullptr) {
     std::unique_ptr<CURLU, decltype(&curl_url_cleanup)> url(curl_url(), curl_url_cleanup);
     if (!url || curl_url_set(url.get(), CURLUPART_URL, current.c_str(), 0) != CURLUE_OK ||
         curl_url_set(url.get(), CURLUPART_URL, location.c_str(), 0) != CURLUE_OK) return {};
     char* value = nullptr;
     if (curl_url_get(url.get(), CURLUPART_URL, &value, 0) != CURLUE_OK) return {};
+    if (settings && !UrlCredentials(value, *settings)) { curl_free(value); return {}; }
     const auto result = NormalizeUrl(value, false);
     curl_free(value);
     return result;
+}
+
+std::string AuthTarget(const Transfer& transfer, bool proxy) {
+    if (proxy && !transfer.connectOnly) return transfer.currentUrl;
+    std::unique_ptr<CURLU, decltype(&curl_url_cleanup)> url(curl_url(), curl_url_cleanup);
+    if (!url || curl_url_set(url.get(), CURLUPART_URL, transfer.currentUrl.c_str(), 0) != CURLUE_OK) return {};
+    char* part = nullptr;
+    if (curl_url_get(url.get(), transfer.connectOnly ? CURLUPART_HOST : CURLUPART_PATH, &part, 0) != CURLUE_OK) return {};
+    std::string result(part);
+    curl_free(part);
+    if (transfer.connectOnly) {
+        if (curl_url_get(url.get(), CURLUPART_PORT, &part, CURLU_DEFAULT_PORT) != CURLUE_OK) return {};
+        result += ':' + std::string(part);
+        curl_free(part);
+    } else if (curl_url_get(url.get(), CURLUPART_QUERY, &part, 0) == CURLUE_OK) {
+        result += '?' + std::string(part);
+        curl_free(part);
+    }
+    return result;
+}
+
+bool DecideAuthentication(Object& request) {
+    auto& transfer = *request.transfer;
+    if (!request.settings.authEnabled || !transfer.manualAuth || transfer.authAttempts >= 6) return true;
+    const bool proxy = transfer.status == 407;
+    if (proxy && transfer.proxyUrl.empty()) return true;
+    for (const auto& [name, value] : request.settings.headers)
+        if (EqualName(name, proxy ? "Proxy-Authorization" : "Authorization")) return true;
+    const auto& challenges = proxy ? transfer.proxyChallenges : transfer.authChallenges;
+    const HttpAuthChallenge* chosen = nullptr;
+    int priority = 0;
+    for (const auto& challenge : challenges) {
+        int strength = challenge.type == 0 && challenge.parameters.contains("realm") ? 1 : 0;
+        if (challenge.type == 1 && challenge.parameters.contains("realm") && challenge.parameters.contains("nonce") &&
+            HttpAuthQuality_nid_no_patch(challenge) != "unsupported") {
+            const auto found = challenge.parameters.find("algorithm");
+            const auto algorithm = found == challenge.parameters.end() ? std::string("MD5") : found->second;
+            if (EqualName(algorithm, "MD5") || EqualName(algorithm, "MD5-sess")) strength = 2;
+            if (EqualName(algorithm, "SHA-256") || EqualName(algorithm, "SHA-256-sess")) strength = 3;
+        }
+        if (strength > priority) { chosen = &challenge; priority = strength; }
+    }
+    if (!chosen) return true;
+    const auto parameter = [&](const char* name) {
+        const auto found = chosen->parameters.find(name);
+        return found == chosen->parameters.end() ? std::string() : found->second;
+    };
+    const auto realm = parameter("realm");
+    const auto origin = NormalizeUrl((proxy ? transfer.proxyUrl : transfer.currentUrl).c_str(), true);
+    std::string username;
+    std::string password;
+    const bool supplied = !proxy && request.settings.urlCredentials && request.settings.credentialOrigin == origin;
+    if (supplied) {
+        username = request.settings.username;
+        password = request.settings.password;
+    } else {
+        const auto callback = request.settings.authCallback;
+        if (!callback) return true;
+        std::array<char, 256> user{};
+        std::array<char, 256> key{};
+        {
+            std::lock_guard lock(request.root->authMutex);
+            for (auto it = request.root->credentials.begin(); it != request.root->credentials.end(); ++it) {
+                if (it->origin != origin || it->realm != realm || it->type != chosen->type || it->proxy != proxy) continue;
+                std::copy_n(it->username.data(), std::min(it->username.size(), user.size() - 1), user.data());
+                std::copy_n(it->password.data(), std::min(it->password.size(), key.size() - 1), key.data());
+                request.root->credentials.splice(request.root->credentials.end(), request.root->credentials, it);
+                break;
+            }
+        }
+        const bool entityRequired = chosen->type == 1 && HttpAuthQuality_nid_no_patch(*chosen) == "auth-int" &&
+            transfer.currentMethod != "GET" && transfer.currentMethod != "HEAD";
+        std::uint8_t* entity = nullptr;
+        std::uint64_t entitySize = 0;
+        int save = 0;
+        int decision;
+        {
+            CallbackScope scope(request);
+            decision = callback(request.id, chosen->type, realm.c_str(), user.data(), key.data(), entityRequired ? 1 : 0,
+                &entity, &entitySize, &save, request.settings.authArgument);
+        }
+        if (request.aborted) return transfer.error = ERROR_ABORTED, false;
+        if (decision < 0) { mbedtls_platform_zeroize(key.data(), key.size()); return true; }
+        const auto* userEnd = static_cast<const char*>(std::memchr(user.data(), 0, user.size()));
+        const auto* keyEnd = static_cast<const char*>(std::memchr(key.data(), 0, key.size()));
+        if (!userEnd || !keyEnd || save != 0 || (entityRequired && ((!entity && entitySize) || entitySize > INT64_MAX))) {
+            mbedtls_platform_zeroize(key.data(), key.size());
+            return transfer.error = ERROR_INVALID_VALUE, false;
+        }
+        username.assign(user.data(), static_cast<std::size_t>(userEnd - user.data()));
+        password.assign(key.data(), static_cast<std::size_t>(keyEnd - key.data()));
+        mbedtls_platform_zeroize(key.data(), key.size());
+        if (entityRequired) {
+            if (entitySize) transfer.upload.assign(reinterpret_cast<const char*>(entity), reinterpret_cast<const char*>(entity) + entitySize);
+            else transfer.upload.clear();
+        }
+    }
+    const auto target = AuthTarget(transfer, proxy);
+    const auto counterKey = origin + '\n' + parameter("nonce");
+    const int error = target.empty() ? ERROR_INVALID_URL : HttpBuildAuthorization_nid_no_patch(*chosen,
+        transfer.currentMethod, target, username, password, transfer.upload, ++transfer.nonceCounters[counterKey], transfer.pendingAuthorization);
+    if (error) {
+        if (!password.empty()) mbedtls_platform_zeroize(password.data(), password.size());
+        return transfer.error = error, false;
+    }
+    if (!supplied) {
+        std::lock_guard lock(request.root->authMutex);
+        std::erase_if(request.root->credentials, [&](const auto& entry) {
+            return entry.origin == origin && entry.realm == realm && entry.type == chosen->type && entry.proxy == proxy;
+        });
+        request.root->credentials.push_back({origin, realm, chosen->type, proxy, username, password});
+        if (request.root->credentials.size() > 16) request.root->credentials.pop_front();
+    }
+    if (!password.empty()) mbedtls_platform_zeroize(password.data(), password.size());
+    ++transfer.authAttempts;
+    transfer.pendingAuthentication = true;
+    transfer.pendingProxyAuth = proxy;
+    transfer.pendingUrl = transfer.currentUrl;
+    transfer.pendingMethod = transfer.currentMethod;
+    transfer.discard = true;
+    transfer.ready = false;
+    return true;
 }
 
 bool DecideRedirect(Object& request) {
@@ -536,11 +724,12 @@ bool DecideRedirect(Object& request) {
     if (request.aborted) return transfer.error = ERROR_ABORTED, false;
     if (decision < 0) return true;
     if (method < 0 || method > 8) return transfer.error = ERROR_INVALID_VALUE, false;
-    const auto next = RedirectUrl(transfer.currentUrl, transfer.redirectLocation);
+    const auto next = RedirectUrl(transfer.currentUrl, transfer.redirectLocation, &request.settings);
     if (next.empty() || (transfer.currentUrl.starts_with("https:") && !next.starts_with("https:")) ||
         transfer.redirects >= 10) return transfer.error = ERROR_NETWORK, false;
     transfer.pendingUrl = next;
     transfer.pendingMethod = method == 8 ? transfer.currentMethod : Method(method);
+    if (request.settings.authEnabled && request.settings.urlCredentials) transfer.manualAuth = true;
     if (method == original && ((transfer.status == 303 && transfer.currentMethod != "HEAD") ||
         ((transfer.status == 301 || transfer.status == 302) && transfer.currentMethod == "POST")))
         transfer.pendingMethod = "GET";
@@ -574,6 +763,7 @@ int FollowRedirect(Object& request) {
         proxy = parent->url;
         url = TunnelUrl(url.c_str(), true);
     }
+    transfer.proxyUrl = proxy;
     if (!set(CURLOPT_URL, url.c_str()) || !set(CURLOPT_PROXY, proxy.c_str()) ||
         !set(CURLOPT_HTTPPROXYTUNNEL, transfer.connectOnly ? 1L : 0L) ||
         !set(CURLOPT_CONNECT_ONLY, transfer.connectOnly ? 1L : 0L)) return transfer.error = ERROR_NETWORK;
@@ -587,23 +777,42 @@ int FollowRedirect(Object& request) {
     curl_slist* headers = nullptr;
     for (auto* entry = transfer.outgoing; entry; entry = entry->next) {
         const std::string_view line(entry->data);
-        const auto name = line.substr(0, line.find(':'));
+        const auto name = line.substr(0, line.find_first_of(":;"));
+        if ((transfer.pendingAuthentication && EqualName(name, transfer.pendingProxyAuth ? "Proxy-Authorization" : "Authorization")) ||
+            (!transfer.pendingAuthentication && ((transfer.authorizationAdded && EqualName(name, "Authorization")) ||
+                (transfer.proxyAuthorizationAdded && EqualName(name, "Proxy-Authorization"))))) continue;
         if ((dropBody && (EqualName(name, "Content-Length") || EqualName(name, "Transfer-Encoding"))) ||
             (changedOrigin && (EqualName(name, "Authorization") || EqualName(name, "Cookie") || EqualName(name, "Host")))) continue;
-        auto* next = curl_slist_append(headers, entry->data);
+        const auto adjusted = EqualName(name, "Content-Length") ? "Content-Length: " + std::to_string(transfer.upload.size()) : std::string(entry->data);
+        auto* next = curl_slist_append(headers, adjusted.c_str());
         if (!next) {
             curl_slist_free_all(headers);
             return transfer.error = ERROR_OUT_OF_MEMORY;
         }
         headers = next;
     }
+    if (transfer.pendingAuthentication) {
+        const auto line = std::string(transfer.pendingProxyAuth ? "Proxy-Authorization: " : "Authorization: ") + transfer.pendingAuthorization;
+        auto* next = curl_slist_append(headers, line.c_str());
+        if (!next) { curl_slist_free_all(headers); return transfer.error = ERROR_OUT_OF_MEMORY; }
+        headers = next;
+    }
     if (!set(CURLOPT_HTTPHEADER, headers) || !set(CURLOPT_PROXYHEADER, transfer.connectOnly ? headers : nullptr)) {
+        set(CURLOPT_HTTPHEADER, transfer.outgoing);
+        set(CURLOPT_PROXYHEADER, transfer.connectOnly ? transfer.outgoing : nullptr);
         curl_slist_free_all(headers);
         return transfer.error = ERROR_NETWORK;
     }
     curl_slist_free_all(transfer.outgoing);
     transfer.outgoing = headers;
-    ++transfer.redirects;
+    if (!transfer.pendingAuthentication) {
+        ++transfer.redirects;
+        transfer.authorizationAdded = false;
+        transfer.proxyAuthorizationAdded = false;
+    } else if (transfer.pendingProxyAuth) transfer.proxyAuthorizationAdded = true;
+    else transfer.authorizationAdded = true;
+    transfer.pendingAuthentication = false;
+    transfer.pendingAuthorization.clear();
     transfer.ready = false;
     transfer.done = false;
     transfer.discard = false;
@@ -614,6 +823,7 @@ int FollowRedirect(Object& request) {
     transfer.sent = false;
     transfer.statusPhase = -1;
     transfer.status = 0;
+    transfer.nativeError = 0;
     transfer.headers.clear();
     transfer.body.clear();
     transfer.consumed = 0;
@@ -654,6 +864,8 @@ std::size_t Header(char* bytes, std::size_t size, std::size_t count, void* argum
             transfer.headers.clear();
             transfer.location = false;
             transfer.redirectLocation.clear();
+            transfer.authChallenges.clear();
+            transfer.proxyChallenges.clear();
             transfer.discard = false;
             const auto space = line.find(' ');
             if (space == std::string_view::npos || line.size() - space < 4) return 0;
@@ -665,6 +877,14 @@ std::size_t Header(char* bytes, std::size_t size, std::size_t count, void* argum
             return 0;
         }
         transfer.headers.append(bytes, length);
+        for (const auto& [prefix, challenges] : {std::pair<std::string_view, std::vector<HttpAuthChallenge>*>("WWW-Authenticate:", &transfer.authChallenges),
+             {"Proxy-Authenticate:", &transfer.proxyChallenges}}) {
+            if (line.size() < prefix.size() || !EqualName(line.substr(0, prefix.size()), prefix)) continue;
+            auto value = line.substr(prefix.size());
+            if (value.ends_with('\n')) value.remove_suffix(1);
+            if (value.ends_with('\r')) value.remove_suffix(1);
+            for (auto& challenge : HttpParseChallenges_nid_no_patch(Trim(value))) challenges->push_back(std::move(challenge));
+        }
         if (line.size() >= 9 && EqualName(line.substr(0, 9), "Location:")) {
             transfer.location = true;
             auto value = line.substr(9);
@@ -678,6 +898,7 @@ std::size_t Header(char* bytes, std::size_t size, std::size_t count, void* argum
             transfer.discard = transfer.redirect && !transfer.manualRedirect && redirect;
             transfer.ready = !transfer.discard;
             if (!Status(*transfer.owner, HeaderReceived)) return 0;
+            if ((transfer.status == 401 || transfer.status == 407) && !DecideAuthentication(*transfer.owner)) return 0;
             if (transfer.manualRedirect && transfer.location && transfer.status >= 300 && transfer.status < 400 &&
                 !DecideRedirect(*transfer.owner)) return 0;
         }
@@ -790,7 +1011,10 @@ int Pump(Object& request) {
             transfer.nativeError = message->data.result;
             if (message->data.result == CURLE_COULDNT_RESOLVE_HOST || message->data.result == CURLE_COULDNT_RESOLVE_PROXY)
                 return RetryResolve(request);
-            if (message->data.result != CURLE_OK && !transfer.error) transfer.error = ERROR_NETWORK;
+            const bool proxyChallenge = transfer.pendingAuthentication && transfer.status == 407 && transfer.connectOnly &&
+                (message->data.result == CURLE_RECV_ERROR || message->data.result == CURLE_HTTP_RETURNED_ERROR ||
+                 message->data.result == CURLE_PROXY || message->data.result == CURLE_COULDNT_CONNECT);
+            if (message->data.result != CURLE_OK && !proxyChallenge && !transfer.error) transfer.error = ERROR_NETWORK;
             if (!transfer.pendingUrl.empty() && !transfer.error) return FollowRedirect(request);
             if (transfer.connectOnly && !transfer.error) {
                 transfer.tunnel = true;
@@ -993,6 +1217,29 @@ extern "C" int APS5_VABI sceHttpSetRedirectCallback(int id, HttpRedirectCallback
     object->settings.redirectArgument = argument;
     return 0;
 }
+
+extern "C" int APS5_VABI sceHttpSetAuthEnabled(int id, int enabled) {
+    if (enabled != 0 && enabled != 1) return ERROR_INVALID_VALUE;
+    return Configure(id, [&](Object& object) { object.settings.authEnabled = enabled != 0; return 0; });
+}
+
+extern "C" int APS5_VABI sceHttpSetAuthInfoCallback(int id, HttpAuthInfoCallback callback, void* argument) {
+    auto object = FindAny(id);
+    if (!object) return ERROR_INVALID_ID;
+    std::lock_guard lock(object->mutex);
+    if (callback && object->transfer && !object->transfer->manualAuth) return ERROR_INVALID_VALUE;
+    object->settings.authCallback = callback;
+    object->settings.authArgument = argument;
+    return 0;
+}
+
+extern "C" int APS5_VABI sceHttpAuthCacheFlush(int id) {
+    auto context = Find(id, Kind::Context);
+    if (!context) return ERROR_INVALID_ID;
+    std::lock_guard lock(context->authMutex);
+    context->credentials.clear();
+    return 0;
+}
 bool HttpInCallbackContext_nid_no_patch(int id) {
     const auto context = Find(id, Kind::Context);
     return context && context->callbacks.load() != 0;
@@ -1068,6 +1315,7 @@ int APS5_VABI sceHttpCreateConnectionWithURL(int parentId, const char* url, int 
     auto object = std::make_shared<Object>(Kind::Connection);
     std::lock_guard lock(parent->mutex);
     object->settings = parent->settings;
+    if (!UrlCredentials(url, object->settings)) return ERROR_INVALID_URL;
     object->settings.keepAlive = keepAlive != 0;
     object->context = parent->context;
     object->parent = parentId;
@@ -1076,7 +1324,7 @@ int APS5_VABI sceHttpCreateConnectionWithURL(int parentId, const char* url, int 
 }
 
 int APS5_VABI sceHttpCreateConnection(int parent, const char* server, const char* scheme, std::uint16_t port, int keepAlive) {
-    if (!server || !scheme) return ERROR_INVALID_URL;
+    if (!server || !scheme || std::strchr(server, '@')) return ERROR_INVALID_URL;
     std::string host(server);
     if (host.find(':') != std::string::npos && !host.starts_with('[')) host = '[' + host + ']';
     const auto url = std::string(scheme) + "://" + host + (port ? ':' + std::to_string(port) : std::string()) + '/';
@@ -1379,7 +1627,9 @@ int APS5_VABI sceHttpsGetSslError(int id, int* error, std::uint32_t* detail) {
     case CURLE_SSL_SHUTDOWN_FAILED: {
         curl_off_t connected = 0;
         curl_easy_getinfo(transfer.easy, CURLINFO_APPCONNECT_TIME_T, &connected);
-        if (connected && (request->url.starts_with("https:") || request->proxy.starts_with("https:"))) {
+        char* effective = nullptr;
+        curl_easy_getinfo(transfer.easy, CURLINFO_EFFECTIVE_URL, &effective);
+        if (connected && ((effective && std::string_view(effective).starts_with("https:")) || transfer.proxyUrl.starts_with("https:"))) {
             *error = static_cast<int>(0x80435062);
             *detail |= 1;
         }
@@ -1390,7 +1640,7 @@ int APS5_VABI sceHttpsGetSslError(int id, int* error, std::uint32_t* detail) {
     }
     long proxyStatus = 0;
     curl_easy_getinfo(transfer.easy, CURLINFO_HTTP_CONNECTCODE, &proxyStatus);
-    if (proxyStatus >= 300 && (request->url.starts_with("https:") || request->proxy.starts_with("https:"))) {
+    if (proxyStatus >= 300 && transfer.proxyUrl.starts_with("https:")) {
         *error = static_cast<int>(0x80435064);
         *detail = 0;
     }
@@ -1429,8 +1679,10 @@ int APS5_VABI sceHttpSendRequest(int id, const void* data, std::size_t size) {
     transfer.currentUrl = request->url;
     transfer.currentMethod = request->method;
     transfer.defaultProxy = proxy;
+    transfer.proxyUrl = proxy;
     transfer.connectOnly = !request->proxy.empty();
-    transfer.manualRedirect = request->settings.redirectCallback != nullptr;
+    transfer.manualAuth = request->settings.authEnabled && (request->settings.authCallback || request->settings.urlCredentials);
+    transfer.manualRedirect = request->settings.redirectCallback || transfer.manualAuth;
     if (size && transfer.manualRedirect) transfer.upload.assign(static_cast<const char*>(data), static_cast<const char*>(data) + size);
     if (!transfer.easy || !transfer.multi) return transfer.error = ERROR_OUT_OF_MEMORY;
     transfer.headerLimit = request->settings.headerLimit;
@@ -1444,14 +1696,14 @@ int APS5_VABI sceHttpSendRequest(int id, const void* data, std::size_t size) {
     set(CURLOPT_FOLLOWLOCATION, request->settings.redirect && !transfer.manualRedirect ? CURLFOLLOW_OBEYCODE : 0L);
     set(CURLOPT_MAXREDIRS, 10L);
     set(CURLOPT_SSL_VERIFYPEER, (request->settings.verify & 1) ? 1L : 0L);
-    set(CURLOPT_SSL_VERIFYHOST, (request->settings.verify & 4) ? 2L : 0L);
+    set(CURLOPT_SSL_VERIFYHOST, (request->settings.verify & 5) == 5 ? 2L : 0L);
     constexpr long minimumVersions[] = {CURL_SSLVERSION_DEFAULT, CURL_SSLVERSION_SSLv2, CURL_SSLVERSION_SSLv3,
         CURL_SSLVERSION_TLSv1_0, CURL_SSLVERSION_TLSv1_1, CURL_SSLVERSION_TLSv1_2};
     const long minimum = std::max<long>(CURL_SSLVERSION_TLSv1_2, minimumVersions[request->settings.minimumTlsVersion]);
     const long tlsVersion = std::max(minimum, minimumVersions[request->settings.tlsVersion]);
     set(CURLOPT_SSLVERSION, tlsVersion);
     set(CURLOPT_PROXY_SSL_VERIFYPEER, (request->settings.verify & 1) ? 1L : 0L);
-    set(CURLOPT_PROXY_SSL_VERIFYHOST, (request->settings.verify & 4) ? 2L : 0L);
+    set(CURLOPT_PROXY_SSL_VERIFYHOST, (request->settings.verify & 5) == 5 ? 2L : 0L);
     set(CURLOPT_PROXY_SSLVERSION, tlsVersion);
     set(CURLOPT_SSL_SESSIONID_CACHE, (request->settings.verify & 0x40) ? 1L : 0L);
     set(CURLOPT_SSL_CTX_FUNCTION, ConfigureTls);

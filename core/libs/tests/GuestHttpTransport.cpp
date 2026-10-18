@@ -3,6 +3,7 @@
 #include "prx/libSceSsl/SslTypes.hpp"
 #include "SslCertificateFixture.hpp"
 #include "HttpTlsFixture.hpp"
+#include "prx/libSceHttp/src/Authentication.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -55,6 +56,9 @@ int APS5_VABI sceHttpSetInflateGZIPEnabled(int, int);
 int APS5_VABI sceHttpSetCookieEnabled(int, int);
 int APS5_VABI sceHttpSetCookieRecvCallback(int, HttpCookieRecvCallback, void*);
 int APS5_VABI sceHttpSetRedirectCallback(int, HttpRedirectCallback, void*);
+int APS5_VABI sceHttpSetAuthEnabled(int, int);
+int APS5_VABI sceHttpSetAuthInfoCallback(int, HttpAuthInfoCallback, void*);
+int APS5_VABI sceHttpAuthCacheFlush(int);
 int APS5_VABI sceHttpSetChunkedTransferEnabled(int, int);
 int APS5_VABI sceHttpSetRequestStatusCallback(int, void (APS5_VABI *)(int, int, void*), void*);
 int APS5_VABI sceHttpsLoadCert(int, int, SceSsl::Data**, SceSsl::Data*, SceSsl::Data*);
@@ -416,6 +420,11 @@ static void Tls(int context, int connection, const char* url, bool mutual) {
     Require(sceHttpsGetSslError(request, &error, &detail) == 0 && error == static_cast<int>(0x80435060) && (detail & 4));
     Require(sceHttpDeleteRequest(request) == 0);
     request = sceHttpCreateRequestWithURL2(connection, "GET", wrongHost.c_str(), 0);
+    Require(sceHttpsDisableOption(request, 1) == 0);
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Read(request);
+    Require(sceHttpDeleteRequest(request) == 0);
+    request = sceHttpCreateRequestWithURL2(connection, "GET", wrongHost.c_str(), 0);
     Require(sceHttpsDisableOption(request, 4) == 0);
     Require(sceHttpSendRequest(request, nullptr, 0) == 0);
     Read(request);
@@ -513,6 +522,293 @@ static std::string ReadAsync(int request, HttpEpollHandle epoll) {
             body.append(data, count);
         }
     }
+}
+
+static void AuthParser() {
+    auto challenges = HttpParseChallenges_nid_no_patch("Digest realm=\"a,b\\\"c\", nonce=\"n\", qop=\"auth-int,auth\", algorithm=SHA-256, Basic realm=\"fallback\"");
+    Require(challenges.size() == 2 && challenges[0].type == 1 && challenges[1].type == 0);
+    Require(challenges[0].parameters.at("realm") == "a,b\"c");
+    Require(HttpAuthQuality_nid_no_patch(challenges[0]) == "auth");
+    challenges = HttpParseChallenges_nid_no_patch("Negotiate token==, Basic realm=\"r\"   ");
+    Require(challenges.size() == 1 && challenges[0].type == 0 && challenges[0].parameters.at("realm") == "r");
+    for (const char* malformed : {" ", "Digest realm=\"unterminated", "Digest realm=\"escape\\", "Basic realm=a, REALM=b"})
+        Require(HttpParseChallenges_nid_no_patch(malformed).empty());
+    std::uint32_t state = 0x1d872b41;
+    for (int index = 0; index < 5000; ++index) {
+        state = state * 1664525U + 1013904223U;
+        std::string input(state % 97, ' ');
+        for (char& value : input) { state = state * 1664525U + 1013904223U; value = static_cast<char>(state >> 24); }
+        for (const auto& challenge : HttpParseChallenges_nid_no_patch(input)) {
+            Require(challenge.type == 0 || challenge.type == 1);
+            for (const auto& [name, value] : challenge.parameters)
+                Require(!name.empty() && name.size() + value.size() <= input.size());
+        }
+    }
+}
+
+struct AuthLog {
+    int context;
+    int connection;
+    int decision = 0;
+    int action = 0;
+    int calls = 0;
+    int type = 0;
+    int needEntity = 0;
+    std::string realm = "test realm";
+    std::string entity;
+    std::vector<std::pair<std::string, std::string>> saved;
+};
+
+static int APS5_VABI Authenticate(int request, int type, const char* realm, char* user, char* password,
+    int needEntity, std::uint8_t** body, std::uint64_t* size, int* save, void* argument) {
+    auto& log = *static_cast<AuthLog*>(argument);
+    ++log.calls;
+    Require(type == log.type && realm == log.realm);
+    Require(needEntity == log.needEntity);
+    log.saved.emplace_back(user, password);
+    Require(sceHttpDeleteRequest(request) == static_cast<int>(0x80431021));
+    Require(sceHttpTerm_nid_postfix(log.context) == static_cast<int>(0x80431021));
+    int status = 0;
+    Require(sceHttpGetStatusCode(request, &status) == 0 && (status == 401 || status == 407));
+    std::snprintf(user, 256, "%s", "guest");
+    std::snprintf(password, 256, "%s", log.action == 10 || (log.action == 12 && log.calls == 1) ? "wrong" : "secret");
+    *save = 0;
+    if (needEntity) {
+        *body = reinterpret_cast<std::uint8_t*>(log.entity.data());
+        *size = log.entity.size();
+    }
+    if (log.action == 3) std::memset(user, 'x', 256);
+    if (log.action == 4) *save = 1;
+    if (log.action == 5 || log.action == 6) { *body = nullptr; *size = UINT64_MAX; }
+    if (log.action == 7) throw std::runtime_error("auth callback test");
+    if (log.action == 8) Require(sceHttpAbortRequest(request) == 0);
+    if (log.action == 9 && log.calls == 1) {
+        const int nested = Request(log.connection, "/binary");
+        Require(sceHttpSendRequest(nested, nullptr, 0) == 0 && Read(nested).size() == 1024);
+        Require(sceHttpDeleteRequest(nested) == 0);
+    }
+    return log.decision;
+}
+
+struct AuthResult {
+    int error;
+    int status;
+    std::string body;
+};
+
+static AuthResult SendAuth(AuthLog& log, const std::string& path, const char* method = "GET",
+    const std::string& body = {}, bool enabled = true, bool callback = true) {
+    log.calls = 0;
+    log.saved.clear();
+    const int request = path.starts_with("http") ? sceHttpCreateRequestWithURL2(log.connection, method, path.c_str(), body.size()) :
+        Request(log.connection, path.c_str(), method, body.size());
+    Require(request > 0 && sceHttpSetAuthEnabled(request, enabled ? 1 : 0) == 0);
+    if (callback) Require(sceHttpSetAuthInfoCallback(request, Authenticate, &log) == 0);
+    AuthResult result{sceHttpSendRequest(request, body.empty() ? nullptr : body.data(), body.size()), 0, {}};
+    if (!result.error) {
+        Require(sceHttpGetStatusCode(request, &result.status) == 0);
+        result.body = Read(request);
+    }
+    Require(sceHttpDeleteRequest(request) == 0);
+    return result;
+}
+
+static void AuthBasic(int context, int connection, const char* url, bool tls) {
+    if (tls) {
+        auto authority = Certificate(RootPem);
+        auto* pointer = &authority;
+        Require(sceHttpsLoadCert(context, 1, &pointer, nullptr, nullptr) == 0);
+    }
+    AuthLog log{context, connection};
+    Require(sceHttpSetAuthEnabled(-1, 1) == InvalidId);
+    Require(sceHttpSetAuthEnabled(connection, 2) == InvalidValue);
+    Require(sceHttpAuthCacheFlush(-1) == InvalidId && sceHttpAuthCacheFlush(connection) == InvalidId);
+    Require(sceHttpSetAuthInfoCallback(connection, Authenticate, &log) == 0);
+    int inherited = Request(connection, "/auth/basic");
+    Require(sceHttpSetAuthInfoCallback(connection, nullptr, nullptr) == 0);
+    Require(sceHttpSendRequest(inherited, nullptr, 0) == 0 && Read(inherited) == "authenticated:");
+    Require(sceHttpDeleteRequest(inherited) == 0);
+    log.calls = 0;
+    Require(sceHttpSetAuthInfoCallback(connection, Authenticate, &log) == 0);
+    Require(sceHttpSetAuthEnabled(connection, 0) == 0);
+    inherited = Request(connection, "/auth/basic");
+    Require(sceHttpSetAuthEnabled(connection, 1) == 0);
+    Require(sceHttpSetAuthInfoCallback(connection, nullptr, nullptr) == 0);
+    Require(sceHttpSendRequest(inherited, nullptr, 0) == 0 && Read(inherited) == "authentication-required" && log.calls == 0);
+    Require(sceHttpDeleteRequest(inherited) == 0);
+    for (int decision : {INT32_MIN, -1, 0, 1, INT32_MAX}) {
+        Require(sceHttpAuthCacheFlush(context) == 0);
+        log.decision = decision;
+        const auto result = SendAuth(log, "/auth/basic");
+        Require(result.error == 0 && result.status == (decision < 0 ? 401 : 200));
+        Require(result.body == (decision < 0 ? "authentication-required" : "authenticated:"));
+        Require(log.calls == 1 && log.saved.front().first.empty() && log.saved.front().second.empty());
+    }
+    log.decision = 0;
+    for (const char* method : {"HEAD", "OPTIONS", "DELETE", "TRACE"}) {
+        const auto result = SendAuth(log, "/auth/basic", method);
+        Require(result.error == 0 && result.status == 200 && result.body == (std::strcmp(method, "HEAD") == 0 ? "" : "authenticated:"));
+    }
+    auto extended = SendAuth(log, "/auth/basic?extraqop=auth-int", "POST", "payload");
+    Require(extended.error == 0 && extended.status == 200 && extended.body == "authenticated:payload");
+    auto result = SendAuth(log, "/auth/basic", "GET", {}, false);
+    Require(result.error == 0 && result.status == 401 && log.calls == 0);
+    result = SendAuth(log, "/auth/basic", "GET", {}, true, false);
+    Require(result.error == 0 && result.status == 401 && log.calls == 0);
+    for (int action : {3, 4, 6, 7, 8, 9, 10, 12}) {
+        log.action = action;
+        result = SendAuth(log, "/auth/basic");
+        Require(result.error == (action == 3 || action == 4 ? InvalidValue : action == 7 ? Network : action == 8 ? Aborted : 0));
+        if (!result.error) Require(result.status == (action == 10 ? 401 : 200));
+        if (action == 10) Require(log.calls == 6);
+        if (action == 12) Require(log.calls == 2 && log.saved.back().second == "wrong");
+    }
+    log.action = 7;
+    std::string address(url);
+    address.insert(address.find("://") + 3, "guest:secret@");
+    result = SendAuth(log, address + "auth/basic");
+    Require(result.error == 0 && result.status == 200 && log.calls == 0);
+    if (!tls) {
+        log.action = 0;
+        log.decision = -1;
+        result = SendAuth(log, address + "auth/basic-redirect");
+        if (result.error || result.status != 401 || log.calls != 1)
+            std::fprintf(stderr, "Cross-origin authentication: error=%08x status=%d callbacks=%d\n",
+                static_cast<unsigned>(result.error), result.status, log.calls);
+        Require(result.error == 0 && result.status == 401 && log.calls == 1);
+        log.action = 7;
+        log.decision = 0;
+    }
+    const int object = sceHttpCreateTemplate(context, "auth-url", 2, 0);
+    const int authenticated = sceHttpCreateConnectionWithURL(object, address.c_str(), 0);
+    Require(authenticated > 0);
+    log.connection = authenticated;
+    result = SendAuth(log, "/auth/basic");
+    Require(result.error == 0 && result.status == 200 && log.calls == 0);
+    result = SendAuth(log, "/auth/basic", "GET", {}, false);
+    Require(result.error == 0 && result.status == 401 && log.calls == 0);
+    Require(sceHttpDeleteConnection(authenticated) == 0 && sceHttpDeleteTemplate(object) == 0);
+    log.connection = connection;
+    log.action = 0;
+    HttpEpollHandle epoll = nullptr;
+    Require(sceHttpCreateEpoll(context, &epoll) == 0);
+    const int request = Request(connection, "/auth/basic");
+    Require(sceHttpSetAuthInfoCallback(request, Authenticate, &log) == 0);
+    Require(sceHttpSetNonblock(request, 1) == 0 && sceHttpSetEpoll(request, epoll, nullptr) == 0);
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(ReadAsync(request, epoll) == "authenticated:");
+    Require(sceHttpDeleteRequest(request) == 0 && sceHttpDestroyEpoll(context, epoll) == 0);
+}
+
+static void AuthDigest(int context, int connection, bool tls) {
+    if (tls) {
+        auto authority = Certificate(RootPem);
+        auto* pointer = &authority;
+        Require(sceHttpsLoadCert(context, 1, &pointer, nullptr, nullptr) == 0);
+    }
+    AuthLog log{context, connection};
+    log.type = 1;
+    for (const char* algorithm : {"MD5", "MD5-sess", "SHA-256", "SHA-256-sess"}) {
+        const auto path = std::string("/auth/digest?algorithm=") + algorithm;
+        const auto result = SendAuth(log, path, "POST", "payload");
+        Require(result.error == 0 && result.status == 200 && result.body == "authenticated:payload" && log.calls == 1);
+    }
+    log.needEntity = 1;
+    log.entity = std::string("changed\0body", 12);
+    for (const char* algorithm : {"MD5", "SHA-256-sess"}) {
+        const auto path = std::string("/auth/digest?qop=auth-int&algorithm=") + algorithm;
+        const auto result = SendAuth(log, path, "POST", "original");
+        Require(result.error == 0 && result.status == 200 && result.body == "authenticated:" + log.entity);
+    }
+    for (bool chunked : {false, true}) {
+        const int request = Request(connection, "/auth/digest?qop=auth-int", "POST", 8);
+        Require(sceHttpSetAuthInfoCallback(request, Authenticate, &log) == 0);
+        if (chunked) Require(sceHttpSetChunkedTransferEnabled(request, 1) == 0);
+        else Require(sceHttpAddRequestHeader(request, "Content-Length", "8", 0) == 0);
+        Require(sceHttpSendRequest(request, "original", 8) == 0 && Read(request) == "authenticated:" + log.entity);
+        Require(sceHttpDeleteRequest(request) == 0);
+    }
+    log.action = 5;
+    auto result = SendAuth(log, "/auth/digest?qop=auth-int", "POST", "original");
+    Require(result.error == InvalidValue);
+    log.action = 0;
+    log.needEntity = 0;
+    for (const char* algorithm : {"MD5", "MD5-sess", "SHA-256", "SHA-256-sess"}) {
+        result = SendAuth(log, std::string("/auth/digest?qop=&algorithm=") + algorithm);
+        Require(result.error == 0 && result.status == 200);
+    }
+    result = SendAuth(log, "/auth/digest?algorithm=SHA-256&userhash=true");
+    Require(result.error == 0 && result.status == 200);
+    result = SendAuth(log, "/auth/stale");
+    Require(result.error == 0 && result.status == 200 && log.calls == 2);
+    result = SendAuth(log, "/auth/multiple?algorithm=SHA-256");
+    Require(result.error == 0 && result.status == 200 && log.type == 1);
+    log.type = 0;
+    log.realm = "fallback";
+    result = SendAuth(log, "/auth/multiple?algorithm=unsupported");
+    Require(result.error == 0 && result.status == 200 && log.calls == 1);
+    log.type = 1;
+    log.realm = "quoted \"realm\", value";
+    result = SendAuth(log, "/auth/digest?realm=quoted%20%22realm%22%2C%20value");
+    Require(result.error == 0 && result.status == 200);
+    log.realm = "test realm";
+    for (const char* path : {"/auth/malformed", "/auth/digest?algorithm=unsupported", "/auth/digest?qop=unsupported"}) {
+        result = SendAuth(log, path);
+        Require(result.error == 0 && result.status == 401 && log.calls == 0);
+    }
+}
+
+static void AuthCache(int context, int connection, const char* url) {
+    AuthLog log{context, connection};
+    Require(sceHttpAuthCacheFlush(context) == 0);
+    Require(SendAuth(log, "/auth/basic").status == 200);
+    Require(log.saved.front().first.empty());
+    Require(SendAuth(log, "/auth/basic").status == 200);
+    Require(log.saved.front() == std::pair<std::string, std::string>("guest", "secret"));
+    Require(sceHttpAuthCacheFlush(context) == 0);
+    Require(SendAuth(log, "/auth/basic").status == 200 && log.saved.front().first.empty());
+    Require(sceHttpAuthCacheFlush(context) == 0);
+    for (int index = 0; index < 16; ++index) {
+        log.realm = "realm-" + std::to_string(index);
+        Require(SendAuth(log, "/auth/basic?realm=" + log.realm).status == 200 && log.saved.front().first.empty());
+    }
+    log.realm = "realm-0";
+    Require(SendAuth(log, "/auth/basic?realm=" + log.realm).status == 200 && log.saved.front().first == "guest");
+    log.realm = "realm-16";
+    Require(SendAuth(log, "/auth/basic?realm=" + log.realm).status == 200);
+    log.realm = "realm-0";
+    Require(SendAuth(log, "/auth/basic?realm=" + log.realm).status == 200 && log.saved.front().first == "guest");
+    log.realm = "realm-1";
+    Require(SendAuth(log, "/auth/basic?realm=" + log.realm).status == 200 && log.saved.front().first.empty());
+    const int other = sceHttpInit_nid_postfix(0, 0, 65536);
+    const int object = sceHttpCreateTemplate(other, "auth-isolation", 2, 0);
+    const int peer = sceHttpCreateConnectionWithURL(object, url, 0);
+    AuthLog isolated{other, peer};
+    isolated.realm = log.realm;
+    Require(SendAuth(isolated, "/auth/basic?realm=" + isolated.realm).status == 200 && isolated.saved.front().first.empty());
+    Require(SendAuth(log, "/auth/basic?realm=" + log.realm).status == 200 && log.saved.front().first == "guest");
+    Require(sceHttpDeleteConnection(peer) == 0 && sceHttpDeleteTemplate(object) == 0);
+    Require(sceHttpTerm_nid_postfix(other) == 0);
+    std::vector<std::thread> workers;
+    for (int index = 0; index < 4; ++index) workers.emplace_back([&, index] {
+        AuthLog state{context, connection};
+        state.type = 1;
+        const auto data = "parallel-" + std::to_string(index);
+        const auto result = SendAuth(state, "/auth/digest?algorithm=SHA-256", "POST", data);
+        Require(result.error == 0 && result.status == 200 && result.body == "authenticated:" + data);
+    });
+    for (auto& worker : workers) worker.join();
+}
+
+static void AuthProxy(int context, int connection) {
+    AuthLog log{context, connection};
+    log.realm = "proxy";
+    Require(sceHttpSetAuthInfoCallback(connection, Authenticate, &log) == 0);
+    const int request = sceHttpCreateRequest(connection, 7, "authenticated.invalid:443", 0);
+    Require(request > 0 && sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(Read(request).size() == 65536 && log.calls == 1);
+    Require(sceHttpDeleteRequest(request) == 0);
+    Require(sceHttpSetAuthInfoCallback(connection, nullptr, nullptr) == 0);
 }
 
 struct RedirectLog {
@@ -1286,6 +1582,11 @@ int main(int argc, char** argv) {
     else if (mode == "framing") Framing(connection);
     else if (mode == "cookie_callbacks") CookieCallbacks(argv[1]);
     else if (mode == "redirect_callbacks" || mode == "redirect_callbacks_tls") RedirectCallbacks(context, connection, mode == "redirect_callbacks_tls");
+    else if (mode == "auth_basic" || mode == "auth_basic_tls") AuthBasic(context, connection, argv[1], mode == "auth_basic_tls");
+    else if (mode == "auth_digest" || mode == "auth_digest_tls") AuthDigest(context, connection, mode == "auth_digest_tls");
+    else if (mode == "auth_cache") AuthCache(context, connection, argv[1]);
+    else if (mode == "auth_proxy") AuthProxy(context, connection);
+    else if (mode == "auth_parser") AuthParser();
     else if (mode == "status" || mode == "status_tls") StatusCallbacks(context, connection, mode == "status_tls");
     else if (mode == "authorities") Authorities();
     else if (mode == "auto_proxy") AutoProxy(context, argv[1]);

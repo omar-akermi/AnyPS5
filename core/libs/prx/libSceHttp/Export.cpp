@@ -176,20 +176,6 @@ int APS5_VABI sceHttpInit_nid_postfix(int memid, int ssl_ctx_id, uint64_t pool_s
     return id;
 }
 
-int APS5_VABI sceHttpSetAuthEnabled(int id, int enable) {
-    if (!HttpHasObject_nid_no_patch(id)) return ERROR_INVALID_ID;
-    if (enable != 0 && enable != 1) return ERROR_INVALID_VALUE;
-    if (enable) NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceHttpSetAuthInfoCallback(int id, HttpAuthInfoCallback callback, void* userArg) {
-    if (!HttpHasObject_nid_no_patch(id)) return ERROR_INVALID_ID;
-    if (callback) NotImplemented_nid_no_patch(__func__);
-    (void)userArg;
-    return 0;
-}
-
 int APS5_VABI sceHttpSetEpoll(int id, HttpEpollHandle eh, void* user_arg) {
     std::shared_ptr<HttpEpoll> epoll;
     {
