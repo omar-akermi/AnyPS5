@@ -141,7 +141,7 @@ if __name__ == "__main__":
 
     http.server.ThreadingHTTPServer.request_queue_size = 64
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    secure = sys.argv[2] in ("tls", "mutual", "expired")
+    secure = sys.argv[2] in ("tls", "mutual", "expired", "async_tls")
     if secure:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2

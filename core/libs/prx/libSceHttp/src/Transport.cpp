@@ -20,6 +20,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -38,6 +39,10 @@ struct Settings {
     bool cookies = false;
     bool inflate = true;
     bool chunked = false;
+    bool nonblock = false;
+    std::shared_ptr<HttpEventSink> epoll;
+    HttpEpollHandle epollHandle = nullptr;
+    void* epollArgument = nullptr;
     std::uint32_t verify = 0xfd;
     long tlsVersion = CURL_SSLVERSION_TLSv1_2;
     std::string authorities;
@@ -58,6 +63,7 @@ struct Transfer {
     bool redirect = false;
     bool location = false;
     bool discard = false;
+    bool paused = false;
     int status = 0;
     int error = 0;
     int nativeError = 0;
@@ -99,6 +105,7 @@ struct CookieStore {
 
 struct Object {
     Kind kind;
+    int id = 0;
     int parent = 0;
     int context = 0;
     Settings settings;
@@ -110,8 +117,11 @@ struct Object {
     std::shared_ptr<CookieStore> cookieStore;
     std::shared_ptr<Object> root;
     std::unique_ptr<Transfer> transfer;
+    std::shared_ptr<std::atomic<bool>> eventAlive = std::make_shared<std::atomic<bool>>(true);
+    std::jthread worker;
 
     explicit Object(Kind value) : kind(value) {}
+    ~Object() { aborted = true; *eventAlive = false; }
 };
 
 struct ParsedCertificate {
@@ -163,6 +173,7 @@ int Insert(std::shared_ptr<Object> object) {
     const auto& parent = registry.at(object->parent);
     object->root = parent->kind == Kind::Context ? parent : parent->root;
     const int id = HttpNextHandle_nid_no_patch();
+    object->id = id;
     registry.emplace(id, std::move(object));
     return id;
 }
@@ -281,7 +292,10 @@ std::size_t Header(char* bytes, std::size_t size, std::size_t count, void* argum
 std::size_t Body(char* bytes, std::size_t size, std::size_t count, void* argument) noexcept {
     auto& transfer = *static_cast<Transfer*>(argument);
     if (transfer.discard) return size * count;
-    if (transfer.consumed != transfer.body.size()) return CURL_WRITEFUNC_PAUSE;
+    if (transfer.consumed != transfer.body.size()) {
+        transfer.paused = true;
+        return CURL_WRITEFUNC_PAUSE;
+    }
     try {
         transfer.body.assign(bytes, bytes + size * count);
         transfer.consumed = 0;
@@ -292,22 +306,83 @@ std::size_t Body(char* bytes, std::size_t size, std::size_t count, void* argumen
     }
 }
 
+int Pump(Object& request) {
+    auto& transfer = *request.transfer;
+    if (request.aborted) return transfer.error = ERROR_ABORTED;
+    int running = 0;
+    if (curl_multi_perform(transfer.multi, &running) != CURLM_OK) return transfer.error = ERROR_NETWORK;
+    int remaining = 0;
+    while (auto* message = curl_multi_info_read(transfer.multi, &remaining)) {
+        if (message->msg == CURLMSG_DONE) {
+            transfer.done = true;
+            transfer.nativeError = message->data.result;
+            if (message->data.result != CURLE_OK && !transfer.error) transfer.error = ERROR_NETWORK;
+        }
+    }
+    return transfer.error;
+}
+
+void Notify(Object& request, std::uint32_t events) {
+    if (request.settings.epoll)
+        request.settings.epoll->Notify({events, events, request.id, request.settings.epollArgument}, request.eventAlive);
+}
+
+void RunAsync(Object& request) noexcept {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(request.settings.receiveTimeout);
+    bool headers = false;
+    bool body = false;
+    try {
+        for (;;) {
+            {
+                std::lock_guard lock(request.mutex);
+                auto& transfer = *request.transfer;
+                if (request.aborted) transfer.error = ERROR_ABORTED;
+                if (transfer.error) {
+                    Notify(request, transfer.error == ERROR_ABORTED ? 0x10U : 0x08U);
+                    return;
+                }
+                if (transfer.consumed < transfer.body.size()) {
+                    deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(request.settings.receiveTimeout);
+                } else {
+                    body = false;
+                    if (transfer.paused) {
+                        transfer.paused = false;
+                        if (curl_easy_pause(transfer.easy, CURLPAUSE_CONT) != CURLE_OK) transfer.error = ERROR_NETWORK;
+                    }
+                    if (!transfer.error) Pump(request);
+                    if (!transfer.done && std::chrono::steady_clock::now() >= deadline) transfer.error = ERROR_NETWORK;
+                }
+                if (transfer.ready && !headers) {
+                    headers = true;
+                    Notify(request, 2);
+                }
+                if (transfer.consumed < transfer.body.size() && !body) {
+                    body = true;
+                    Notify(request, 1);
+                }
+                if (transfer.error) {
+                    Notify(request, transfer.error == ERROR_ABORTED ? 0x10U : 0x08U);
+                    return;
+                }
+                if (transfer.done) {
+                    Notify(request, 1);
+                    return;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    } catch (...) {
+        std::lock_guard lock(request.mutex);
+        request.transfer->error = ERROR_OUT_OF_MEMORY;
+        Notify(request, 8);
+    }
+}
+
 int Drive(Object& request, bool headers) {
     auto& transfer = *request.transfer;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(request.settings.receiveTimeout);
     for (;;) {
-        if (request.aborted) return transfer.error = ERROR_ABORTED;
-        int running = 0;
-        if (curl_multi_perform(transfer.multi, &running) != CURLM_OK) return transfer.error = ERROR_NETWORK;
-        int remaining = 0;
-        while (auto* message = curl_multi_info_read(transfer.multi, &remaining)) {
-            if (message->msg == CURLMSG_DONE) {
-                transfer.done = true;
-                transfer.nativeError = message->data.result;
-                if (message->data.result != CURLE_OK && !transfer.error) transfer.error = ERROR_NETWORK;
-            }
-        }
-        if (transfer.error) return transfer.error;
+        if (const int error = Pump(request)) return error;
         if ((headers && transfer.ready) || (!headers && transfer.consumed < transfer.body.size()) || transfer.done) return 0;
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) return transfer.error = ERROR_NETWORK;
@@ -329,6 +404,10 @@ int Delete(int id, Kind kind) {
         object->aborted = true;
         registry.erase(found);
     }
+    {
+        std::lock_guard lock(object->mutex);
+        *object->eventAlive = false;
+    }
     HttpForgetCallback_nid_no_patch(id);
     return 0;
 }
@@ -349,11 +428,37 @@ void HttpContextStarted_nid_no_patch(int id) {
     auto object = std::make_shared<Object>(Kind::Context);
     object->cookieStore = std::make_shared<CookieStore>();
     object->context = id;
+    object->id = id;
     std::lock_guard lock(registryMutex);
     registry.emplace(id, std::move(object));
 }
 
 bool HttpHasObject_nid_no_patch(int id) { return FindAny(id) != nullptr; }
+
+int HttpBindEpoll_nid_no_patch(int id, std::shared_ptr<HttpEventSink> sink, HttpEpollHandle handle, void* argument) {
+    auto object = FindAny(id);
+    if (!object || object->kind == Kind::Context) return ERROR_INVALID_ID;
+    if (sink && sink->Context() != object->context) return ERROR_INVALID_ID;
+    std::lock_guard lock(object->mutex);
+    *object->eventAlive = false;
+    object->eventAlive = std::make_shared<std::atomic<bool>>(true);
+    object->settings.epoll = std::move(sink);
+    object->settings.epollHandle = handle;
+    object->settings.epollArgument = argument;
+    if (object->transfer && object->transfer->ready) Notify(*object, 2);
+    if (object->transfer && (object->transfer->done || object->transfer->consumed < object->transfer->body.size())) Notify(*object, 1);
+    return 0;
+}
+
+int HttpGetEpoll_nid_no_patch(int id, HttpEpollHandle* handle, void** argument) {
+    if (!handle) return ERROR_INVALID_VALUE;
+    auto object = FindAny(id);
+    if (!object || object->kind == Kind::Context) return ERROR_INVALID_ID;
+    std::lock_guard lock(object->mutex);
+    *handle = object->settings.epollHandle;
+    if (argument) *argument = object->settings.epollArgument;
+    return 0;
+}
 
 bool HttpHasCertificates_nid_no_patch(int id) {
     auto context = Find(id, Kind::Context);
@@ -374,6 +479,10 @@ void HttpContextStopped_nid_no_patch(int id) {
                 it = registry.erase(it);
             } else ++it;
         }
+    }
+    for (const auto& object : removed) {
+        std::lock_guard lock(object->mutex);
+        *object->eventAlive = false;
     }
 }
 
@@ -470,8 +579,34 @@ int APS5_VABI sceHttpSetRequestContentLength(int id, std::uint64_t length) {
     });
 }
 int APS5_VABI sceHttpSetNonblock(int id, int enabled) {
-    if (!FindAny(id)) return ERROR_INVALID_ID;
-    if (enabled != 0) NotImplemented_nid_no_patch(__func__);
+    if (enabled != 0 && enabled != 1) return ERROR_INVALID_VALUE;
+    return Configure(id, [&](Object& object) { object.settings.nonblock = enabled != 0; return 0; });
+}
+int APS5_VABI sceHttpGetNonblock(int id, int* enabled) {
+    if (!enabled) return ERROR_INVALID_VALUE;
+    auto object = FindAny(id);
+    if (!object) return ERROR_INVALID_ID;
+    std::lock_guard lock(object->mutex);
+    *enabled = object->settings.nonblock;
+    return 0;
+}
+int APS5_VABI sceHttpTrySetNonblock(int id, int enabled) {
+    auto object = FindAny(id);
+    if (!object) return ERROR_INVALID_ID;
+    if (enabled != 0 && enabled != 1) return ERROR_INVALID_VALUE;
+    std::unique_lock lock(object->mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return ERROR_HTTP_BUSY;
+    if (object->transfer) return ERROR_INVALID_VALUE;
+    object->settings.nonblock = enabled != 0;
+    return 0;
+}
+int APS5_VABI sceHttpTryGetNonblock(int id, int* enabled) {
+    if (!enabled) return ERROR_INVALID_VALUE;
+    auto object = FindAny(id);
+    if (!object) return ERROR_INVALID_ID;
+    std::unique_lock lock(object->mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return ERROR_HTTP_BUSY;
+    *enabled = object->settings.nonblock;
     return 0;
 }
 int APS5_VABI sceHttpSetAutoRedirect(int id, int enabled) {
@@ -676,6 +811,10 @@ int APS5_VABI sceHttpSendRequest(int id, const void* data, std::size_t size) {
     set(CURLOPT_HTTPHEADER, transfer.outgoing);
     if (curl_multi_add_handle(transfer.multi, transfer.easy) != CURLM_OK) return transfer.error = ERROR_NETWORK;
     transfer.attached = true;
+    if (request->settings.nonblock) {
+        request->worker = std::jthread([object = request.get()] { RunAsync(*object); });
+        return 0;
+    }
     const int error = Drive(*request, true);
     return error ? error : transfer.ready ? 0 : ERROR_NETWORK;
 }
@@ -690,15 +829,18 @@ int APS5_VABI sceHttpReadData(int id, void* output, std::size_t size) {
     auto& transfer = *request->transfer;
     if (transfer.error) return transfer.error;
     if (!size) return 0;
+    if (request->settings.nonblock && transfer.consumed == transfer.body.size()) return transfer.done ? 0 : ERROR_AGAIN;
     if (transfer.consumed == transfer.body.size() && !transfer.done) {
         transfer.body.clear();
         transfer.consumed = 0;
+        transfer.paused = false;
         if (curl_easy_pause(transfer.easy, CURLPAUSE_CONT) != CURLE_OK) return transfer.error = ERROR_NETWORK;
         if (const int error = Drive(*request, false)) return error;
     }
     const auto count = std::min({size, transfer.body.size() - transfer.consumed, request->settings.readBlock, std::size_t{INT_MAX}});
     if (count) std::memcpy(output, transfer.body.data() + transfer.consumed, count);
     transfer.consumed += count;
+    if (request->settings.nonblock && transfer.done && transfer.consumed == transfer.body.size()) Notify(*request, 1);
     return static_cast<int>(count);
 }
 
@@ -714,7 +856,9 @@ int APS5_VABI sceHttpGetStatusCode(int id, int* status) {
     auto request = Find(id, Kind::Request);
     if (!request) return ERROR_INVALID_ID;
     std::lock_guard lock(request->mutex);
-    if (!request->transfer || !request->transfer->ready) return ERROR_NETWORK;
+    if (request->aborted) return ERROR_ABORTED;
+    if (request->transfer && request->transfer->error) return request->transfer->error;
+    if (!request->transfer || !request->transfer->ready) return request->transfer && request->settings.nonblock ? ERROR_AGAIN : ERROR_NETWORK;
     *status = request->transfer->status;
     return 0;
 }
@@ -724,7 +868,9 @@ int APS5_VABI sceHttpGetAllResponseHeaders(int id, char** headers, std::size_t* 
     auto request = Find(id, Kind::Request);
     if (!request) return ERROR_INVALID_ID;
     std::lock_guard lock(request->mutex);
-    if (!request->transfer || !request->transfer->ready) return ERROR_NETWORK;
+    if (request->aborted) return ERROR_ABORTED;
+    if (request->transfer && request->transfer->error) return request->transfer->error;
+    if (!request->transfer || !request->transfer->ready) return request->transfer && request->settings.nonblock ? ERROR_AGAIN : ERROR_NETWORK;
     *headers = request->transfer->headers.data();
     *size = request->transfer->headers.size();
     return 0;
@@ -735,7 +881,9 @@ int APS5_VABI sceHttpGetResponseContentLength(int id, int* result, std::uint64_t
     auto request = Find(id, Kind::Request);
     if (!request) return ERROR_INVALID_ID;
     std::lock_guard lock(request->mutex);
-    if (!request->transfer || !request->transfer->ready) return ERROR_NETWORK;
+    if (request->aborted) return ERROR_ABORTED;
+    if (request->transfer && request->transfer->error) return request->transfer->error;
+    if (!request->transfer || !request->transfer->ready) return request->transfer && request->settings.nonblock ? ERROR_AGAIN : ERROR_NETWORK;
     curl_off_t length = -1;
     if (curl_easy_getinfo(request->transfer->easy, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &length) != CURLE_OK) return ERROR_NETWORK;
     *result = length < 0 ? static_cast<int>(0x80431071) : 0;

@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <limits>
 #include <map>
 #include <memory>
@@ -93,11 +94,39 @@ private:
 #endif
 };
 
-struct HttpEpoll {
+struct HttpEpoll : HttpEventSink {
+    struct Entry {
+        HttpNBEvent event;
+        std::weak_ptr<std::atomic<bool>> alive;
+    };
     HostMutex mutex;
     HostCondition wake;
     bool aborted = false;
     bool destroyed = false;
+    bool exhausted = false;
+    std::deque<Entry> events;
+
+    explicit HttpEpoll(int context) : HttpEventSink(context) {}
+
+    void Notify(HttpNBEvent event, std::weak_ptr<std::atomic<bool>> alive) noexcept override {
+        std::lock_guard lock(mutex);
+        if (destroyed || aborted) return;
+        std::erase_if(events, [](const auto& entry) {
+            const auto token = entry.alive.lock();
+            return !token || !token->load();
+        });
+        for (auto& entry : events) {
+            if (entry.alive.lock() == alive.lock() && entry.event.id == event.id) {
+                entry.event.events |= event.events;
+                entry.event.eventDetail |= event.eventDetail;
+                wake.NotifyAll();
+                return;
+            }
+        }
+        try { events.push_back({event, std::move(alive)}); }
+        catch (const std::bad_alloc&) { exhausted = true; }
+        wake.NotifyAll();
+    }
 };
 
 static std::mutex g_stateMutex;
@@ -134,7 +163,7 @@ int APS5_VABI sceHttpCreateEpoll(int http_ctx_id, HttpEpollHandle* eh) {
     if (g_contexts.empty()) return ERROR_BEFORE_INIT;
     if (!g_contexts.contains(http_ctx_id)) return ERROR_INVALID_ID;
     if (!eh) return ERROR_INVALID_VALUE;
-    auto epoll = std::make_shared<HttpEpoll>();
+    auto epoll = std::make_shared<HttpEpoll>(http_ctx_id);
     *eh = epoll.get();
     g_epolls.emplace(epoll.get(), std::move(epoll));
     return 0;
@@ -149,6 +178,7 @@ int APS5_VABI sceHttpDestroyEpoll(int http_ctx_id, HttpEpollHandle eh) {
         if (!eh) return ERROR_INVALID_VALUE;
         epoll = FindEpoll(eh);
         if (!epoll) return ERROR_INVALID_ID;
+        if (epoll->Context() != http_ctx_id) return ERROR_INVALID_ID;
         g_epolls.erase(eh);
     }
     MarkDestroyed(*epoll);
@@ -182,11 +212,14 @@ int APS5_VABI sceHttpSetAuthInfoCallback(int id, HttpAuthInfoCallback callback, 
 }
 
 int APS5_VABI sceHttpSetEpoll(int id, HttpEpollHandle eh, void* user_arg) {
-    if (HttpHasObject_nid_no_patch(id)) NotImplemented_nid_no_patch(__func__);
-    (void)id;
-    (void)eh;
-    (void)user_arg;
-    return 0;
+    std::shared_ptr<HttpEpoll> epoll;
+    {
+        std::lock_guard lock(g_stateMutex);
+        if (g_contexts.empty()) return ERROR_BEFORE_INIT;
+        epoll = FindEpoll(eh);
+        if (!epoll) return ERROR_INVALID_ID;
+    }
+    return HttpBindEpoll_nid_no_patch(id, std::move(epoll), eh, user_arg);
 }
 
 int APS5_VABI sceHttpSetResolveRetry(int id, int32_t retry) {
@@ -225,18 +258,23 @@ int APS5_VABI sceHttpTerm_nid_postfix(int http_ctx_id) {
         if (g_contexts.empty()) return ERROR_BEFORE_INIT;
         if (g_contexts.erase(http_ctx_id) == 0) return ERROR_INVALID_ID;
         HttpContextStopped_nid_no_patch(http_ctx_id);
-        if (!g_contexts.empty()) return 0;
-        for (auto& [handle, epoll] : g_epolls) epolls.push_back(std::move(epoll));
-        g_epolls.clear();
+        for (auto it = g_epolls.begin(); it != g_epolls.end();) {
+            if (it->second->Context() == http_ctx_id) {
+                epolls.push_back(std::move(it->second));
+                it = g_epolls.erase(it);
+            } else ++it;
+        }
     }
     for (const auto& epoll : epolls) MarkDestroyed(*epoll);
     return 0;
 }
 
 int APS5_VABI sceHttpUnsetEpoll(int id) {
-    if (HttpHasObject_nid_no_patch(id)) NotImplemented_nid_no_patch(__func__);
-    (void)id;
-    return 0;
+    return HttpBindEpoll_nid_no_patch(id, nullptr, nullptr, nullptr);
+}
+
+int APS5_VABI sceHttpGetEpoll(int id, HttpEpollHandle* eh, void** user_arg) {
+    return HttpGetEpoll_nid_no_patch(id, eh, user_arg);
 }
 
 int APS5_VABI sceHttpWaitRequest(HttpEpollHandle eh, HttpNBEvent* nbev, int maxevents, int timeout) {
@@ -249,14 +287,28 @@ int APS5_VABI sceHttpWaitRequest(HttpEpollHandle eh, HttpNBEvent* nbev, int maxe
         if (!epoll) return ERROR_INVALID_ID;
     }
     std::unique_lock lock(epoll->mutex);
-    const auto woken = [&] { return epoll->aborted || epoll->destroyed; };
+    const auto woken = [&] {
+        std::erase_if(epoll->events, [](const auto& entry) {
+            auto alive = entry.alive.lock();
+            return !alive || !alive->load();
+        });
+        return epoll->aborted || epoll->destroyed || epoll->exhausted || !epoll->events.empty();
+    };
     if (timeout < 0) {
         while (!woken()) epoll->wake.Wait(lock);
     } else {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(timeout);
         while (!woken() && std::chrono::steady_clock::now() < deadline) epoll->wake.WaitUntil(lock, deadline);
     }
-    return epoll->aborted ? ERROR_ABORTED : 0;
+    if (epoll->aborted) return ERROR_ABORTED;
+    if (epoll->destroyed) return 0;
+    if (epoll->exhausted) return ERROR_OUT_OF_MEMORY;
+    int count = 0;
+    while (count < maxevents && !epoll->events.empty()) {
+        nbev[count++] = epoll->events.front().event;
+        epoll->events.pop_front();
+    }
+    return count;
 }
 
 int APS5_VABI sceHttpRedirectCacheFlush(int http_ctx_id) {

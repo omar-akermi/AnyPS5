@@ -1,4 +1,5 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "SceTypes.hpp"
 #include "prx/libSceSsl/SslTypes.hpp"
 #include "SslCertificateFixture.hpp"
 #include "HttpTlsFixture.hpp"
@@ -36,6 +37,15 @@ int APS5_VABI sceHttpSetResponseHeaderMaxSize(int, std::uint64_t);
 int APS5_VABI sceHttpSetRecvBlockSize(int, std::uint32_t);
 int APS5_VABI sceHttpAbortRequest(int);
 int APS5_VABI sceHttpSetNonblock(int, int);
+int APS5_VABI sceHttpGetNonblock(int, int*);
+int APS5_VABI sceHttpTryGetNonblock(int, int*);
+int APS5_VABI sceHttpTrySetNonblock(int, int);
+int APS5_VABI sceHttpCreateEpoll(int, HttpEpollHandle*);
+int APS5_VABI sceHttpDestroyEpoll(int, HttpEpollHandle);
+int APS5_VABI sceHttpSetEpoll(int, HttpEpollHandle, void*);
+int APS5_VABI sceHttpUnsetEpoll(int);
+int APS5_VABI sceHttpGetEpoll(int, HttpEpollHandle*, void**);
+int APS5_VABI sceHttpWaitRequest(HttpEpollHandle, HttpNBEvent*, int, int);
 int APS5_VABI sceHttpSetAutoRedirect(int, int);
 int APS5_VABI sceHttpSetInflateGZIPEnabled(int, int);
 int APS5_VABI sceHttpSetCookieEnabled(int, int);
@@ -59,6 +69,7 @@ constexpr int InvalidId = static_cast<int>(0x80431100);
 constexpr int InvalidValue = static_cast<int>(0x804311fe);
 constexpr int Network = static_cast<int>(0x80431063);
 constexpr int Aborted = static_cast<int>(0x80431080);
+constexpr int Again = static_cast<int>(0x80431082);
 
 template<typename TFunction>
 static bool Unsupported(TFunction function) {
@@ -212,7 +223,7 @@ static void Failures(int connection) {
     Require(sceHttpSendRequest(secure, nullptr, 0) == Network);
     Require(sceHttpDeleteRequest(secure) == 0);
     int request = Request(connection, "/headers");
-    Require(Unsupported([&] { sceHttpSetNonblock(request, 1); }));
+    Require(sceHttpSetNonblock(request, 0) == 0);
     Require(sceHttpSetAutoRedirect(request, 1) == 0);
     Require(sceHttpSetInflateGZIPEnabled(request, 1) == 0);
     Require(sceHttpSetResponseHeaderMaxSize(request, 64) == 0);
@@ -402,6 +413,175 @@ static void Expired(int context, int connection) {
     Require(sceHttpDeleteRequest(request) == 0);
 }
 
+static std::string ReadAsync(int request, HttpEpollHandle epoll) {
+    std::string body;
+    char data[4096];
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (;;) {
+        Require(std::chrono::steady_clock::now() < deadline);
+        const int count = sceHttpReadData(request, data, sizeof(data));
+        if (!count) return body;
+        if (count == Again) {
+            HttpNBEvent event;
+            Require(sceHttpWaitRequest(epoll, &event, 1, 100000) >= 0);
+        } else {
+            Require(count > 0 && count <= static_cast<int>(sizeof(data)));
+            body.append(data, count);
+        }
+    }
+}
+
+static void AsyncTls(int context, int connection) {
+    HttpEpollHandle epoll = nullptr;
+    Require(sceHttpCreateEpoll(context, &epoll) == 0);
+    Require(sceHttpSetEpoll(connection, epoll, nullptr) == 0);
+    Require(sceHttpSetNonblock(connection, 1) == 0);
+    int request = Request(connection, "/binary");
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    HttpNBEvent event;
+    Require(sceHttpWaitRequest(epoll, &event, 1, 2000000) == 1 && (event.events & 8));
+    char byte;
+    Require(sceHttpReadData(request, &byte, 1) == Network);
+    Require(sceHttpDeleteRequest(request) == 0);
+    auto authority = Certificate(RootPem);
+    auto* pointer = &authority;
+    Require(sceHttpsLoadCert(context, 1, &pointer, nullptr, nullptr) == 0);
+    request = Request(connection, "/binary");
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(ReadAsync(request, epoll).size() == 1024);
+    Require(sceHttpDeleteRequest(request) == 0);
+    Require(sceHttpDestroyEpoll(context, epoll) == 0);
+}
+
+static void Async(int context, int connection, const char* url) {
+    static_assert(sizeof(HttpNBEvent) == 24);
+    static_assert(offsetof(HttpNBEvent, userArg) == 16);
+    HttpEpollHandle epoll = nullptr;
+    Require(sceHttpCreateEpoll(context, &epoll) == 0);
+    Require(sceHttpSetEpoll(-1, epoll, nullptr) == InvalidId);
+    Require(sceHttpSetNonblock(connection, 2) == InvalidValue);
+    Require(sceHttpGetNonblock(connection, nullptr) == InvalidValue);
+    Require(sceHttpTrySetNonblock(connection, 1) == 0);
+    int enabled = -1;
+    Require(sceHttpTryGetNonblock(connection, &enabled) == 0 && enabled == 1);
+    int argument = 42;
+    Require(sceHttpSetEpoll(connection, epoll, &argument) == 0);
+    int request = Request(connection, "/slow/async");
+    HttpEpollHandle inherited = nullptr;
+    void* pointer = nullptr;
+    Require(sceHttpGetEpoll(request, &inherited, &pointer) == 0 && inherited == epoll && pointer == &argument);
+    Require(sceHttpGetEpoll(request, &inherited, nullptr) == 0 && inherited == epoll);
+    Require(sceHttpGetEpoll(request, nullptr, &pointer) == InvalidValue);
+    Require(sceHttpGetNonblock(request, &enabled) == 0 && enabled == 1);
+    const auto start = std::chrono::steady_clock::now();
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(250));
+    int status = 123;
+    Require(sceHttpGetStatusCode(request, &status) == Again && status == 123);
+    char* headers = reinterpret_cast<char*>(&argument);
+    std::size_t length = 42;
+    Require(sceHttpGetAllResponseHeaders(request, &headers, &length) == Again && length == 42);
+    char data[16];
+    Require(sceHttpReadData(request, data, sizeof(data)) == Again);
+    HttpNBEvent events[2]{};
+    events[1].id = -999;
+    Require(sceHttpWaitRequest(epoll, events, 1, 2000000) == 1);
+    Require(events[0].id == request && events[0].userArg == &argument && (events[0].events & 2));
+    Require(events[1].id == -999);
+    Require(ReadAsync(request, epoll) == std::string("hello\0world", 11));
+    Require(sceHttpGetStatusCode(request, &status) == 0 && status == 200);
+    Require(sceHttpDeleteRequest(request) == 0);
+    Require(sceHttpWaitRequest(epoll, events, 2, 0) == 0);
+
+    for (const char* path : {"/chunked", "/close", "/gzip", "/slowbody", "/large"}) {
+        request = Request(connection, path);
+        Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+        const auto body = ReadAsync(request, epoll);
+        if (std::strcmp(path, "/large") == 0) {
+            Require(body.size() == 8 * 1024 * 1024);
+            for (std::size_t i = 0; i < body.size(); ++i) Require(static_cast<unsigned char>(body[i]) == i % 256);
+        } else Require(body == std::string("hello\0world", 11));
+        Require(sceHttpDeleteRequest(request) == 0);
+    }
+    request = Request(connection, "/echo", "POST", 100000);
+    std::string upload(100000, 'u');
+    Require(sceHttpSendRequest(request, upload.data(), upload.size()) == 0);
+    upload.assign(100000, 'x');
+    Require(ReadAsync(request, epoll) == std::string(100000, 'u'));
+    Require(sceHttpDeleteRequest(request) == 0);
+
+    std::vector<int> requests;
+    for (int i = 0; i < 8; ++i) {
+        const int current = Request(connection, "/binary");
+        requests.push_back(current);
+        Require(sceHttpSendRequest(current, nullptr, 0) == 0);
+    }
+    for (int current : requests) {
+        Require(ReadAsync(current, epoll).size() == 1024);
+        Require(sceHttpDeleteRequest(current) == 0);
+    }
+    request = Request(connection, "/slow/abort-async");
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(sceHttpAbortRequest(request) == 0);
+    Require(sceHttpWaitRequest(epoll, events, 1, 2000000) == 1);
+    Require(events[0].id == request && (events[0].events & 0x10));
+    Require(sceHttpReadData(request, data, sizeof(data)) == Aborted);
+    Require(sceHttpDeleteRequest(request) == 0);
+
+    request = Request(connection, "/slow/timeout-async");
+    Require(sceHttpSetRecvTimeOut(request, 20000) == 0);
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(sceHttpWaitRequest(epoll, events, 1, 2000000) == 1);
+    Require(events[0].id == request && (events[0].events & 8));
+    Require(sceHttpReadData(request, data, sizeof(data)) == Network);
+    status = 123;
+    Require(sceHttpGetStatusCode(request, &status) == Network && status == 123);
+    Require(sceHttpDeleteRequest(request) == 0);
+
+    request = Request(connection, "/slow/detached-async");
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(sceHttpUnsetEpoll(request) == 0);
+    Require(sceHttpWaitRequest(epoll, events, 1, 500000) == 0);
+    Require(sceHttpSetEpoll(request, epoll, &argument) == 0);
+    Require(sceHttpWaitRequest(epoll, events, 1, 0) == 1 && events[0].id == request);
+    Require(ReadAsync(request, epoll) == std::string("hello\0world", 11));
+    Require(sceHttpDeleteRequest(request) == 0);
+
+    request = Request(connection, "/slow/deleted-async");
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(sceHttpDeleteRequest(request) == 0);
+    Require(sceHttpWaitRequest(epoll, events, 2, 0) == 0);
+    request = Request(connection, "/slow/destroyed-async");
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(sceHttpDestroyEpoll(context, epoll) == 0);
+    Require(sceHttpDeleteRequest(request) == 0);
+    Require(sceHttpSetNonblock(connection, 0) == 0);
+    Require(sceHttpUnsetEpoll(connection) == 0);
+
+    const int other = sceHttpInit_nid_postfix(0, 0, 65536);
+    HttpEpollHandle own = nullptr;
+    Require(sceHttpCreateEpoll(other, &own) == 0);
+    Require(sceHttpSetEpoll(connection, own, nullptr) == InvalidId);
+    Require(sceHttpDestroyEpoll(context, own) == InvalidId);
+    std::atomic<int> result{-999};
+    std::thread waiter([&] { HttpNBEvent event; result = sceHttpWaitRequest(own, &event, 1, -1); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    Require(sceHttpTerm_nid_postfix(other) == 0);
+    waiter.join();
+    Require(result == 0 || result == InvalidId);
+    Require(sceHttpDeleteConnection(-1) == InvalidId);
+    for (int i = 0; i < 16; ++i) {
+        const int temporary = sceHttpInit_nid_postfix(0, 0, 65536);
+        const int object = sceHttpCreateTemplate(temporary, "async teardown", 2, 0);
+        const int parent = sceHttpCreateConnectionWithURL(object, url, 0);
+        Require(sceHttpSetNonblock(parent, 1) == 0);
+        const int current = Request(parent, "/slow/terminated-async");
+        Require(sceHttpSendRequest(current, nullptr, 0) == 0);
+        Require(sceHttpTerm_nid_postfix(temporary) == 0);
+        Require(sceHttpReadData(current, data, sizeof(data)) == InvalidId);
+    }
+}
+
 static void Lifecycle(int context, int connection) {
     int request = Request(connection, "/slow/abort");
     Require(sceHttpDeleteConnection(connection) == static_cast<int>(0x80431021));
@@ -468,6 +648,8 @@ int main(int argc, char** argv) {
     else if (mode == "streaming") Streaming(connection);
     else if (mode == "failures") Failures(connection);
     else if (mode == "session") Session(context, connection, argv[1]);
+    else if (mode == "async") Async(context, connection, argv[1]);
+    else if (mode == "async_tls") AsyncTls(context, connection);
     else if (mode == "tls" || mode == "mutual") Tls(context, connection, argv[1], mode == "mutual");
     else if (mode == "expired") Expired(context, connection);
     else if (mode == "lifecycle") { Lifecycle(context, connection); return 0; }
