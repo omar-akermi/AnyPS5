@@ -22,8 +22,7 @@ int HttpGetEpoll_nid_no_patch(int id, HttpEpollHandle* handle, void** argument);
 int HttpNextHandle_nid_no_patch();
 void HttpContextStarted_nid_no_patch(int id, int sslContext);
 void HttpContextStopped_nid_no_patch(int id);
-void HttpForgetCallback_nid_no_patch(int id);
-bool HttpHasCallback_nid_no_patch(int id);
+using HttpRequestStatusCallback = void (APS5_VABI *)(int, int, void*);
 bool HttpHasObject_nid_no_patch(int id);
 bool HttpInCallbackContext_nid_no_patch(int id);
 

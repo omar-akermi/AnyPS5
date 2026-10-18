@@ -26,10 +26,16 @@
 
 extern "C" int APS5_VABI sceNetCtlGetInfo(int code, NetCtlInfo* info);
 extern "C" int __real_mbedtls_ssl_set_hostname(mbedtls_ssl_context* context, const char* hostname);
+extern "C" CURLcode __real_Curl_cookie_add(void* data, void* cookies, const char* line,
+    const char* domain, const char* path, int flags);
 
 namespace {
 
 enum class Kind { Context, Template, Connection, Request };
+enum RequestPhase {
+    ConnectionReserved, ResolvingName, NameResolved, Connecting, Connected, TlsConnecting,
+    TlsConnected, SendingRequest, RequestSent, ReceivingHeader, HeaderReceived
+};
 
 struct Settings {
     std::string agent;
@@ -50,6 +56,12 @@ struct Settings {
     bool autoProxy = false;
     HttpsCallback sslCallback = nullptr;
     void* sslArgument = nullptr;
+    HttpRequestStatusCallback statusCallback = nullptr;
+    void* statusArgument = nullptr;
+    HttpCookieRecvCallback cookieCallback = nullptr;
+    void* cookieArgument = nullptr;
+    HttpRedirectCallback redirectCallback = nullptr;
+    void* redirectArgument = nullptr;
     std::shared_ptr<HttpEventSink> epoll;
     HttpEpollHandle epollHandle = nullptr;
     void* epollArgument = nullptr;
@@ -64,7 +76,18 @@ struct Settings {
     ~Settings() { if (!key.empty()) mbedtls_platform_zeroize(key.data(), key.size()); }
 };
 
+struct Object;
+
+struct IncomingCookie {
+    void* cookies;
+    std::string line;
+    std::string domain;
+    std::string path;
+    int flags;
+};
+
 struct Transfer {
+    Object* owner = nullptr;
     CURL* easy = curl_easy_init();
     CURLM* multi = curl_multi_init();
     curl_slist* outgoing = nullptr;
@@ -72,6 +95,16 @@ struct Transfer {
     bool ready = false;
     bool done = false;
     bool redirect = false;
+    bool manualRedirect = false;
+    bool connectOnly = false;
+    int redirects = 0;
+    std::string currentUrl;
+    std::string currentMethod;
+    std::string defaultProxy;
+    std::string redirectLocation;
+    std::string pendingUrl;
+    std::string pendingMethod;
+    std::vector<char> upload;
     bool location = false;
     bool discard = false;
     bool paused = false;
@@ -86,10 +119,13 @@ struct Transfer {
     std::chrono::steady_clock::time_point resolveStarted;
     std::chrono::steady_clock::time_point sendStarted;
     int status = 0;
+    int statusPhase = -1;
     int error = 0;
     int nativeError = 0;
     std::uint32_t verifyError = 0;
     std::exception_ptr callbackError;
+    bool sslCallbackFailed = false;
+    std::vector<IncomingCookie> incomingCookies;
     std::string peerHostname;
     std::size_t headerLimit = 0;
     std::string headers;
@@ -191,6 +227,26 @@ bool InCallback(int id) {
     return false;
 }
 
+bool Status(Object& request, int phase) noexcept {
+    auto& transfer = *request.transfer;
+    if (transfer.callbackError) return false;
+    if (transfer.statusPhase != phase) {
+        transfer.statusPhase = phase;
+        if (const auto callback = request.settings.statusCallback) {
+            try {
+                CallbackScope scope(request);
+                callback(request.id, phase, request.settings.statusArgument);
+            } catch (...) {
+                transfer.callbackError = std::current_exception();
+                transfer.error = ERROR_NETWORK;
+                return false;
+            }
+        }
+    }
+    if (request.aborted) transfer.error = ERROR_ABORTED;
+    return !transfer.error;
+}
+
 std::uint32_t VerificationBits(std::uint32_t flags) {
     std::uint32_t result = 0;
     if (flags & MBEDTLS_X509_BADCERT_CN_MISMATCH) result |= 4;
@@ -252,6 +308,7 @@ int VerifyCertificate(void* argument, mbedtls_x509_crt* certificate, int depth, 
         } catch (...) {
             if (chain.certs) SslReleaseCaList_nid_no_patch(request.root->sslContext, chain);
             request.transfer->callbackError = std::current_exception();
+            request.transfer->sslCallbackFailed = true;
             return MBEDTLS_ERR_X509_FATAL_ERROR;
         }
     }
@@ -259,6 +316,8 @@ int VerifyCertificate(void* argument, mbedtls_x509_crt* certificate, int depth, 
 }
 
 CURLcode ConfigureTls(CURL*, void* context, void* argument) {
+    auto& request = *static_cast<Object*>(argument);
+    if (!Status(request, Connected) || !Status(request, TlsConnecting)) return CURLE_ABORTED_BY_CALLBACK;
     mbedtls_ssl_conf_verify(static_cast<mbedtls_ssl_config*>(context), VerifyCertificate, argument);
     return CURLE_OK;
 }
@@ -293,17 +352,6 @@ int Insert(std::shared_ptr<Object> object) {
     object->id = id;
     registry.emplace(id, std::move(object));
     return id;
-}
-
-bool HasCallbacks(int id) {
-    std::lock_guard lock(registryMutex);
-    while (id) {
-        if (HttpHasCallback_nid_no_patch(id)) return true;
-        const auto found = registry.find(id);
-        if (found == registry.end()) break;
-        id = found->second->parent;
-    }
-    return false;
 }
 
 bool EqualName(std::string_view a, std::string_view b) {
@@ -463,15 +511,149 @@ int NewRequest(int connection, const char* method, const char* location, std::ui
     return Insert(std::move(request));
 }
 
+std::string RedirectUrl(const std::string& current, const std::string& location) {
+    std::unique_ptr<CURLU, decltype(&curl_url_cleanup)> url(curl_url(), curl_url_cleanup);
+    if (!url || curl_url_set(url.get(), CURLUPART_URL, current.c_str(), 0) != CURLUE_OK ||
+        curl_url_set(url.get(), CURLUPART_URL, location.c_str(), 0) != CURLUE_OK) return {};
+    char* value = nullptr;
+    if (curl_url_get(url.get(), CURLUPART_URL, &value, 0) != CURLUE_OK) return {};
+    const auto result = NormalizeUrl(value, false);
+    curl_free(value);
+    return result;
+}
+
+bool DecideRedirect(Object& request) {
+    auto& transfer = *request.transfer;
+    int method = 8;
+    for (int index = 0; index < 8; ++index)
+        if (transfer.currentMethod == Method(index)) method = index;
+    const int original = method;
+    int decision = request.settings.redirect ? 0 : -1;
+    if (const auto callback = request.settings.redirectCallback) {
+        CallbackScope scope(request);
+        decision = callback(request.id, transfer.status, &method, transfer.redirectLocation.c_str(), request.settings.redirectArgument);
+    }
+    if (request.aborted) return transfer.error = ERROR_ABORTED, false;
+    if (decision < 0) return true;
+    if (method < 0 || method > 8) return transfer.error = ERROR_INVALID_VALUE, false;
+    const auto next = RedirectUrl(transfer.currentUrl, transfer.redirectLocation);
+    if (next.empty() || (transfer.currentUrl.starts_with("https:") && !next.starts_with("https:")) ||
+        transfer.redirects >= 10) return transfer.error = ERROR_NETWORK, false;
+    transfer.pendingUrl = next;
+    transfer.pendingMethod = method == 8 ? transfer.currentMethod : Method(method);
+    if (method == original && ((transfer.status == 303 && transfer.currentMethod != "HEAD") ||
+        ((transfer.status == 301 || transfer.status == 302) && transfer.currentMethod == "POST")))
+        transfer.pendingMethod = "GET";
+    transfer.discard = true;
+    transfer.ready = false;
+    return true;
+}
+
+int FollowRedirect(Object& request) {
+    auto& transfer = *request.transfer;
+    if (curl_multi_remove_handle(transfer.multi, transfer.easy) != CURLM_OK) return transfer.error = ERROR_NETWORK;
+    transfer.attached = false;
+    const bool changedOrigin = NormalizeUrl(transfer.currentUrl.c_str(), true) != NormalizeUrl(transfer.pendingUrl.c_str(), true);
+    transfer.currentUrl = std::move(transfer.pendingUrl);
+    transfer.pendingUrl.clear();
+    transfer.currentMethod = std::move(transfer.pendingMethod);
+    const bool dropBody = transfer.currentMethod == "GET" || transfer.currentMethod == "HEAD";
+    if (dropBody) transfer.upload.clear();
+    const auto set = [&](CURLoption option, auto value) {
+        return curl_easy_setopt(transfer.easy, option, value) == CURLE_OK;
+    };
+    if (!set(CURLOPT_POSTFIELDS, static_cast<const char*>(nullptr)) || !set(CURLOPT_HTTPGET, 1L) ||
+        !set(CURLOPT_NOBODY, 0L)) return transfer.error = ERROR_NETWORK;
+    transfer.connectOnly = transfer.currentMethod == "CONNECT";
+    std::string url = transfer.currentUrl;
+    std::string proxy = transfer.defaultProxy;
+    if (transfer.connectOnly) {
+        if (!transfer.upload.empty()) return transfer.error = ERROR_INVALID_VALUE;
+        const auto parent = Find(request.parent, Kind::Connection);
+        if (!parent) return transfer.error = ERROR_INVALID_ID;
+        proxy = parent->url;
+        url = TunnelUrl(url.c_str(), true);
+    }
+    if (!set(CURLOPT_URL, url.c_str()) || !set(CURLOPT_PROXY, proxy.c_str()) ||
+        !set(CURLOPT_HTTPPROXYTUNNEL, transfer.connectOnly ? 1L : 0L) ||
+        !set(CURLOPT_CONNECT_ONLY, transfer.connectOnly ? 1L : 0L)) return transfer.error = ERROR_NETWORK;
+    if (transfer.currentMethod == "HEAD") {
+        if (!set(CURLOPT_NOBODY, 1L)) return transfer.error = ERROR_NETWORK;
+    } else if (!transfer.upload.empty() || transfer.currentMethod == "POST" || transfer.currentMethod == "PUT") {
+        if (!set(CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(transfer.upload.size())) ||
+            !set(CURLOPT_COPYPOSTFIELDS, transfer.upload.empty() ? "" : transfer.upload.data())) return transfer.error = ERROR_NETWORK;
+    }
+    if (!set(CURLOPT_CUSTOMREQUEST, transfer.currentMethod.c_str())) return transfer.error = ERROR_NETWORK;
+    curl_slist* headers = nullptr;
+    for (auto* entry = transfer.outgoing; entry; entry = entry->next) {
+        const std::string_view line(entry->data);
+        const auto name = line.substr(0, line.find(':'));
+        if ((dropBody && (EqualName(name, "Content-Length") || EqualName(name, "Transfer-Encoding"))) ||
+            (changedOrigin && (EqualName(name, "Authorization") || EqualName(name, "Cookie") || EqualName(name, "Host")))) continue;
+        auto* next = curl_slist_append(headers, entry->data);
+        if (!next) {
+            curl_slist_free_all(headers);
+            return transfer.error = ERROR_OUT_OF_MEMORY;
+        }
+        headers = next;
+    }
+    if (!set(CURLOPT_HTTPHEADER, headers) || !set(CURLOPT_PROXYHEADER, transfer.connectOnly ? headers : nullptr)) {
+        curl_slist_free_all(headers);
+        return transfer.error = ERROR_NETWORK;
+    }
+    curl_slist_free_all(transfer.outgoing);
+    transfer.outgoing = headers;
+    ++transfer.redirects;
+    transfer.ready = false;
+    transfer.done = false;
+    transfer.discard = false;
+    transfer.location = false;
+    transfer.tunnel = false;
+    transfer.resolving = false;
+    transfer.sending = false;
+    transfer.sent = false;
+    transfer.statusPhase = -1;
+    transfer.status = 0;
+    transfer.headers.clear();
+    transfer.body.clear();
+    transfer.consumed = 0;
+    if (curl_multi_add_handle(transfer.multi, transfer.easy) != CURLM_OK) return transfer.error = ERROR_NETWORK;
+    transfer.attached = true;
+    return 0;
+}
+
 std::size_t Header(char* bytes, std::size_t size, std::size_t count, void* argument) noexcept {
     auto& transfer = *static_cast<Transfer*>(argument);
     const auto length = size * count;
     try {
+        for (const auto& cookie : transfer.incomingCookies) {
+            auto& request = *transfer.owner;
+            int decision = 0;
+            if (const auto callback = request.settings.cookieCallback) {
+                char* url = nullptr;
+                if (curl_easy_getinfo(transfer.easy, CURLINFO_EFFECTIVE_URL, &url) != CURLE_OK || !url) return 0;
+                CallbackScope scope(request);
+                decision = callback(request.id, url, cookie.line.data(), cookie.line.size(), request.settings.cookieArgument);
+            }
+            if (request.aborted) {
+                transfer.error = ERROR_ABORTED;
+                return 0;
+            }
+            if (decision >= 0) {
+                std::lock_guard lock(request.cookieStore->mutex);
+                if (__real_Curl_cookie_add(transfer.easy, cookie.cookies, cookie.line.c_str(),
+                    cookie.domain.c_str(), cookie.path.c_str(), cookie.flags) != CURLE_OK) return 0;
+            }
+        }
+        transfer.incomingCookies.clear();
         const std::string_view line(bytes, length);
         if (transfer.ready) return length;
         if (line.starts_with("HTTP/")) {
+            if (transfer.statusPhase < RequestSent && !Status(*transfer.owner, RequestSent)) return 0;
+            if (!Status(*transfer.owner, ReceivingHeader)) return 0;
             transfer.headers.clear();
             transfer.location = false;
+            transfer.redirectLocation.clear();
             transfer.discard = false;
             const auto space = line.find(' ');
             if (space == std::string_view::npos || line.size() - space < 4) return 0;
@@ -483,15 +665,29 @@ std::size_t Header(char* bytes, std::size_t size, std::size_t count, void* argum
             return 0;
         }
         transfer.headers.append(bytes, length);
-        if (line.size() >= 9 && EqualName(line.substr(0, 9), "Location:")) transfer.location = true;
+        if (line.size() >= 9 && EqualName(line.substr(0, 9), "Location:")) {
+            transfer.location = true;
+            auto value = line.substr(9);
+            if (value.ends_with('\n')) value.remove_suffix(1);
+            if (value.ends_with('\r')) value.remove_suffix(1);
+            transfer.redirectLocation = Trim(value);
+        }
         if (line == "\r\n" && transfer.status >= 200) {
-            transfer.discard = transfer.redirect && transfer.location &&
+            const bool redirect = transfer.location &&
                 (transfer.status == 301 || transfer.status == 302 || transfer.status == 303 || transfer.status == 307 || transfer.status == 308);
+            transfer.discard = transfer.redirect && !transfer.manualRedirect && redirect;
             transfer.ready = !transfer.discard;
+            if (!Status(*transfer.owner, HeaderReceived)) return 0;
+            if (transfer.manualRedirect && transfer.location && transfer.status >= 300 && transfer.status < 400 &&
+                !DecideRedirect(*transfer.owner)) return 0;
         }
         return length;
-    } catch (...) {
+    } catch (const std::bad_alloc&) {
         transfer.error = ERROR_OUT_OF_MEMORY;
+        return 0;
+    } catch (...) {
+        transfer.callbackError = std::current_exception();
+        transfer.error = ERROR_NETWORK;
         return 0;
     }
 }
@@ -520,7 +716,13 @@ int ResolverStarted(void*, void*, void* argument) noexcept {
     curl_easy_getinfo(transfer.easy, CURLINFO_NAMELOOKUP_TIME_T, &transfer.lookupBaseline);
     if (!transfer.retrying) transfer.resolveRetries = 0;
     transfer.retrying = false;
-    return 0;
+    return Status(*transfer.owner, ResolvingName) ? 0 : 1;
+}
+
+int SocketPrepared(void* argument, curl_socket_t, curlsocktype) noexcept {
+    auto& request = *static_cast<Object*>(argument);
+    if (request.transfer->statusPhase == ResolvingName && !Status(request, NameResolved)) return CURL_SOCKOPT_ERROR;
+    return Status(request, Connecting) ? CURL_SOCKOPT_OK : CURL_SOCKOPT_ERROR;
 }
 
 int SendStarted(void* argument, char*, char*, int, int) noexcept {
@@ -530,7 +732,10 @@ int SendStarted(void* argument, char*, char*, int, int) noexcept {
     transfer.sent = false;
     transfer.sendStarted = std::chrono::steady_clock::now();
     curl_easy_getinfo(transfer.easy, CURLINFO_POSTTRANSFER_TIME_T, &transfer.sendBaseline);
-    return CURL_PREREQFUNC_OK;
+    auto& request = *transfer.owner;
+    if (transfer.statusPhase < Connected && !Status(request, Connected)) return CURL_PREREQFUNC_ABORT;
+    if (transfer.statusPhase == TlsConnecting && !Status(request, TlsConnected)) return CURL_PREREQFUNC_ABORT;
+    return Status(request, SendingRequest) ? CURL_PREREQFUNC_OK : CURL_PREREQFUNC_ABORT;
 }
 
 int RetryResolve(Object& request) {
@@ -546,6 +751,7 @@ int RetryResolve(Object& request) {
     transfer.nativeError = 0;
     transfer.error = 0;
     transfer.retrying = true;
+    transfer.statusPhase = -1;
     if (curl_multi_add_handle(transfer.multi, transfer.easy) != CURLM_OK) return transfer.error = ERROR_NETWORK;
     transfer.attached = true;
     return 0;
@@ -555,6 +761,7 @@ int Pump(Object& request) {
     TransferScope scope(request);
     auto& transfer = *request.transfer;
     if (request.aborted) return transfer.error = ERROR_ABORTED;
+    if (transfer.statusPhase < 0 && !Status(request, ConnectionReserved)) return transfer.error;
     if (transfer.tunnel) {
         if (transfer.done || transfer.consumed < transfer.body.size()) return transfer.error;
         transfer.body.resize(CURL_MAX_WRITE_SIZE);
@@ -584,7 +791,8 @@ int Pump(Object& request) {
             if (message->data.result == CURLE_COULDNT_RESOLVE_HOST || message->data.result == CURLE_COULDNT_RESOLVE_PROXY)
                 return RetryResolve(request);
             if (message->data.result != CURLE_OK && !transfer.error) transfer.error = ERROR_NETWORK;
-            if (!request.proxy.empty() && !transfer.error) {
+            if (!transfer.pendingUrl.empty() && !transfer.error) return FollowRedirect(request);
+            if (transfer.connectOnly && !transfer.error) {
                 transfer.tunnel = true;
                 transfer.done = false;
                 transfer.sent = true;
@@ -607,6 +815,8 @@ int Pump(Object& request) {
         if (elapsed > transfer.sendBaseline || transfer.ready) {
             transfer.sending = false;
             transfer.sent = true;
+            if (transfer.statusPhase < RequestSent && !Status(request, RequestSent)) return transfer.error;
+            if (transfer.statusPhase < ReceivingHeader && !Status(request, ReceivingHeader)) return transfer.error;
         } else if (now - transfer.sendStarted >= std::chrono::microseconds(request.settings.sendTimeout)) {
             transfer.nativeError = CURLE_OPERATION_TIMEDOUT;
             return transfer.error = ERROR_NETWORK;
@@ -705,7 +915,6 @@ int Delete(int id, Kind kind) {
         std::lock_guard lock(object->mutex);
         *object->eventAlive = false;
     }
-    HttpForgetCallback_nid_no_patch(id);
     return 0;
 }
 
@@ -730,6 +939,20 @@ extern "C" int HttpSetPeerHostname_nid_no_patch(mbedtls_ssl_context* context, co
     return __real_mbedtls_ssl_set_hostname(context, nullptr);
 }
 
+extern "C" CURLcode HttpReceiveCookie_nid_no_patch(void* data, void* cookies, const char* line,
+    const char* domain, const char* path, int flags) {
+    if (activeRequest && activeRequest->transfer->easy == data && domain && path &&
+        activeRequest->settings.cookieCallback && (flags & 1)) {
+        try {
+            activeRequest->transfer->incomingCookies.push_back({cookies, line, domain, path, flags});
+            return CURLE_OK;
+        } catch (...) {
+            return CURLE_OUT_OF_MEMORY;
+        }
+    }
+    return __real_Curl_cookie_add(data, cookies, line, domain, path, flags);
+}
+
 void HttpContextStarted_nid_no_patch(int id, int sslContext) {
     if (!InitializeCurl()) throw std::runtime_error("HTTP backend initialization failed");
     auto object = std::make_shared<Object>(Kind::Context);
@@ -742,6 +965,34 @@ void HttpContextStarted_nid_no_patch(int id, int sslContext) {
 }
 
 bool HttpHasObject_nid_no_patch(int id) { return FindAny(id) != nullptr; }
+
+extern "C" int APS5_VABI sceHttpSetRequestStatusCallback(int id, HttpRequestStatusCallback callback, void* argument) {
+    auto object = FindAny(id);
+    if (!object) return ERROR_INVALID_ID;
+    std::lock_guard lock(object->mutex);
+    object->settings.statusCallback = callback;
+    object->settings.statusArgument = argument;
+    return 0;
+}
+
+extern "C" int APS5_VABI sceHttpSetCookieRecvCallback(int id, HttpCookieRecvCallback callback, void* argument) {
+    auto object = FindAny(id);
+    if (!object) return ERROR_INVALID_ID;
+    std::lock_guard lock(object->mutex);
+    object->settings.cookieCallback = callback;
+    object->settings.cookieArgument = argument;
+    return 0;
+}
+
+extern "C" int APS5_VABI sceHttpSetRedirectCallback(int id, HttpRedirectCallback callback, void* argument) {
+    auto object = FindAny(id);
+    if (!object) return ERROR_INVALID_ID;
+    std::lock_guard lock(object->mutex);
+    if (callback && object->transfer && !object->transfer->manualRedirect) return ERROR_INVALID_VALUE;
+    object->settings.redirectCallback = callback;
+    object->settings.redirectArgument = argument;
+    return 0;
+}
 bool HttpInCallbackContext_nid_no_patch(int id) {
     const auto context = Find(id, Kind::Context);
     return context && context->callbacks.load() != 0;
@@ -780,7 +1031,6 @@ void HttpContextStopped_nid_no_patch(int id) {
             if (it->second->context == id) {
                 it->second->aborted = true;
                 removed.push_back(std::move(it->second));
-                HttpForgetCallback_nid_no_patch(it->first);
                 it = registry.erase(it);
             } else ++it;
         }
@@ -946,12 +1196,12 @@ int APS5_VABI sceHttpSetChunkedTransferEnabled(int id, int enabled) {
 }
 
 int APS5_VABI sceHttpsEnableOption(int id, std::uint32_t flags) {
-    if (flags & ~0xfdU) NotImplemented_nid_no_patch(__func__);
+    if (flags & ~0xffU) NotImplemented_nid_no_patch(__func__);
     return Configure(id, [&](Object& object) { object.settings.verify |= flags; return 0; });
 }
 
 int APS5_VABI sceHttpsDisableOption(int id, std::uint32_t flags) {
-    if (flags & ~0xfdU) NotImplemented_nid_no_patch(__func__);
+    if (flags & ~0xffU) NotImplemented_nid_no_patch(__func__);
     return Configure(id, [&](Object& object) { object.settings.verify &= ~flags; return 0; });
 }
 
@@ -1093,7 +1343,7 @@ int APS5_VABI sceHttpsGetSslError(int id, int* error, std::uint32_t* detail) {
     *detail = 0;
     if (!request->transfer) return 0;
     const auto& transfer = *request->transfer;
-    if (transfer.callbackError) {
+    if (transfer.sslCallbackFailed) {
         *error = static_cast<int>(0x80435063);
         *detail = 1;
         return 0;
@@ -1171,11 +1421,17 @@ int APS5_VABI sceHttpSendRequest(int id, const void* data, std::size_t size) {
         if (!request->settings.key.empty()) mbedtls_platform_zeroize(request->settings.key.data(), request->settings.key.size());
         request->settings.key = request->root->settings.key;
     }
-    if (HasCallbacks(id)) NotImplemented_nid_no_patch(__func__);
     if ((request->method == "GET" || request->method == "HEAD") && size) return ERROR_INVALID_VALUE;
     if (!InitializeCurl()) return ERROR_NETWORK;
     request->transfer = std::make_unique<Transfer>();
     auto& transfer = *request->transfer;
+    transfer.owner = request.get();
+    transfer.currentUrl = request->url;
+    transfer.currentMethod = request->method;
+    transfer.defaultProxy = proxy;
+    transfer.connectOnly = !request->proxy.empty();
+    transfer.manualRedirect = request->settings.redirectCallback != nullptr;
+    if (size && transfer.manualRedirect) transfer.upload.assign(static_cast<const char*>(data), static_cast<const char*>(data) + size);
     if (!transfer.easy || !transfer.multi) return transfer.error = ERROR_OUT_OF_MEMORY;
     transfer.headerLimit = request->settings.headerLimit;
     transfer.redirect = request->settings.redirect;
@@ -1185,7 +1441,7 @@ int APS5_VABI sceHttpSendRequest(int id, const void* data, std::size_t size) {
     set(CURLOPT_URL, request->url.c_str());
     set(CURLOPT_PROTOCOLS_STR, "http,https");
     set(CURLOPT_REDIR_PROTOCOLS_STR, request->url.starts_with("https:") ? "https" : "http,https");
-    set(CURLOPT_FOLLOWLOCATION, request->settings.redirect ? CURLFOLLOW_OBEYCODE : 0L);
+    set(CURLOPT_FOLLOWLOCATION, request->settings.redirect && !transfer.manualRedirect ? CURLFOLLOW_OBEYCODE : 0L);
     set(CURLOPT_MAXREDIRS, 10L);
     set(CURLOPT_SSL_VERIFYPEER, (request->settings.verify & 1) ? 1L : 0L);
     set(CURLOPT_SSL_VERIFYHOST, (request->settings.verify & 4) ? 2L : 0L);
@@ -1205,7 +1461,7 @@ int APS5_VABI sceHttpSendRequest(int id, const void* data, std::size_t size) {
         set(CURLOPT_CAINFO_BLOB, &blob);
         set(CURLOPT_PROXY_CAINFO_BLOB, &blob);
     }
-    if (!request->settings.certificate.empty()) {
+    if ((request->settings.verify & 2) && !request->settings.certificate.empty()) {
         curl_blob cert{request->settings.certificate.data(), request->settings.certificate.size(), CURL_BLOB_COPY};
         curl_blob key{request->settings.key.data(), request->settings.key.size(), CURL_BLOB_COPY};
         set(CURLOPT_SSLCERTTYPE, request->settings.certificate.front() == 0x30 ? "DER" : "PEM");
@@ -1242,6 +1498,8 @@ int APS5_VABI sceHttpSendRequest(int id, const void* data, std::size_t size) {
     set(CURLOPT_DNS_CACHE_TIMEOUT, 0L);
     set(CURLOPT_PREREQFUNCTION, SendStarted);
     set(CURLOPT_PREREQDATA, &transfer);
+    set(CURLOPT_SOCKOPTFUNCTION, SocketPrepared);
+    set(CURLOPT_SOCKOPTDATA, request.get());
     set(CURLOPT_CUSTOMREQUEST, request->method.c_str());
     if (request->method == "HEAD") set(CURLOPT_NOBODY, 1L);
     else if (size || chunked || request->method == "POST" || request->method == "PUT") {

@@ -53,7 +53,10 @@ int APS5_VABI sceHttpWaitRequest(HttpEpollHandle, HttpNBEvent*, int, int);
 int APS5_VABI sceHttpSetAutoRedirect(int, int);
 int APS5_VABI sceHttpSetInflateGZIPEnabled(int, int);
 int APS5_VABI sceHttpSetCookieEnabled(int, int);
+int APS5_VABI sceHttpSetCookieRecvCallback(int, HttpCookieRecvCallback, void*);
+int APS5_VABI sceHttpSetRedirectCallback(int, HttpRedirectCallback, void*);
 int APS5_VABI sceHttpSetChunkedTransferEnabled(int, int);
+int APS5_VABI sceHttpSetRequestStatusCallback(int, void (APS5_VABI *)(int, int, void*), void*);
 int APS5_VABI sceHttpsLoadCert(int, int, SceSsl::Data**, SceSsl::Data*, SceSsl::Data*);
 int APS5_VABI sceHttpsUnloadCert(int);
 int APS5_VABI sceHttpsGetSslError(int, int*, std::uint32_t*);
@@ -374,6 +377,10 @@ static void Tls(int context, int connection, const char* url, bool mutual) {
         auto wrong = Certificate(RootKey);
         Require(sceHttpsLoadCert(context, 1, &pointer, &cert, &wrong) == InvalidValue);
         Require(sceHttpsLoadCert(context, 1, &pointer, &cert, &key) == 0);
+        request = Request(connection, "/binary");
+        Require(sceHttpSendRequest(request, nullptr, 0) == Network);
+        Require(sceHttpDeleteRequest(request) == 0);
+        Require(sceHttpsEnableOption(connection, 2) == 0);
     }
     request = Request(connection, "/binary");
     Require(sceHttpsSetSslVersion(request, 5) == 0);
@@ -393,6 +400,11 @@ static void Tls(int context, int connection, const char* url, bool mutual) {
         Require(sceHttpSendRequest(request, nullptr, 0) == 0);
         Require(Read(request).size() == 1024);
         Require(sceHttpDeleteRequest(request) == 0);
+        Require(sceHttpsDisableOption(connection, 2) == 0);
+        request = Request(connection, "/binary");
+        Require(sceHttpSendRequest(request, nullptr, 0) == Network);
+        Require(sceHttpDeleteRequest(request) == 0);
+        Require(sceHttpsEnableOption(connection, 2) == 0);
     }
     request = Request(connection, "/downgrade");
     Require(sceHttpSendRequest(request, nullptr, 0) == Network);
@@ -500,6 +512,264 @@ static std::string ReadAsync(int request, HttpEpollHandle epoll) {
             Require(count > 0 && count <= static_cast<int>(sizeof(data)));
             body.append(data, count);
         }
+    }
+}
+
+struct RedirectLog {
+    int context;
+    int decision;
+    int method = -1;
+    int action = 0;
+    int calls = 0;
+};
+
+static int APS5_VABI RedirectDecision(int request, int status, std::int32_t* method, const char* location, void* argument) {
+    auto& log = *static_cast<RedirectLog*>(argument);
+    ++log.calls;
+    Require(status >= 300 && status < 400 && location && method);
+    int current = 0;
+    char* headers = nullptr;
+    std::size_t length = 0;
+    Require(sceHttpGetStatusCode(request, &current) == 0 && current == status);
+    Require(sceHttpGetAllResponseHeaders(request, &headers, &length) == 0);
+    Require(std::string(headers, length).find("Location:") != std::string::npos);
+    Require(sceHttpDeleteRequest(request) == static_cast<int>(0x80431021));
+    Require(sceHttpTerm_nid_postfix(log.context) == static_cast<int>(0x80431021));
+    if (log.method >= 0) *method = log.method;
+    if (log.action == 1) throw std::runtime_error("redirect callback test");
+    if (log.action == 2) Require(sceHttpAbortRequest(request) == 0);
+    return log.decision;
+}
+
+static void RedirectCallbacks(int context, int connection, bool tls) {
+    if (tls) {
+        auto authority = Certificate(RootPem);
+        auto* pointer = &authority;
+        Require(sceHttpsLoadCert(context, 1, &pointer, nullptr, nullptr) == 0);
+    }
+    RedirectLog log{context, 0};
+    Require(sceHttpSetRedirectCallback(connection, RedirectDecision, &log) == 0);
+    for (int decision : {INT32_MIN, -1, 0, 1, INT32_MAX}) {
+        log.decision = decision;
+        log.calls = 0;
+        const int request = Request(connection, "/redirect/302");
+        Require(sceHttpSetAutoRedirect(request, 0) == 0);
+        Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+        const auto response = Read(request);
+        if (response != (decision < 0 ? "discard" : "GET:"))
+            std::fprintf(stderr, "redirect decision=%d body=%s size=%zu\n", decision, response.c_str(), response.size());
+        Require(response == (decision < 0 ? "discard" : "GET:"));
+        Require(log.calls == 1 && sceHttpDeleteRequest(request) == 0);
+    }
+    constexpr const char* names[] = {"GET", "POST", "HEAD", "OPTIONS", "PUT", "DELETE", "TRACE", "CONNECT"};
+    log.decision = 0;
+    for (int method = 0; method < 8; ++method) {
+        log.method = method;
+        log.calls = 0;
+        const int request = Request(connection, "/redirect/307");
+        Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+        const auto body = Read(request);
+        if (method == 7) {
+            Require(body.size() == 65536);
+            for (std::size_t index = 0; index < body.size(); ++index)
+                Require(static_cast<unsigned char>(body[index]) == index % 256);
+        } else Require(body == (method == 2 ? std::string() : std::string(names[method]) + ':'));
+        Require(log.calls == 1 && sceHttpDeleteRequest(request) == 0);
+    }
+    log.method = 4;
+    int request = Request(connection, "/redirect/307", "POST", 7);
+    Require(sceHttpSendRequest(request, "payload", 7) == 0 && Read(request) == "PUT:payload");
+    Require(sceHttpDeleteRequest(request) == 0);
+    log.method = 9;
+    request = Request(connection, "/redirect/302");
+    Require(sceHttpSendRequest(request, nullptr, 0) == InvalidValue);
+    Require(sceHttpDeleteRequest(request) == 0);
+    log.method = -1;
+    log.calls = 0;
+    request = Request(connection, "/loop");
+    Require(sceHttpSendRequest(request, nullptr, 0) == Network && log.calls == 11);
+    Require(sceHttpDeleteRequest(request) == 0);
+    for (int action : {1, 2}) {
+        log.action = action;
+        request = Request(connection, "/redirect/302");
+        Require(sceHttpSendRequest(request, nullptr, 0) == (action == 1 ? Network : Aborted));
+        Require(sceHttpDeleteRequest(request) == 0);
+    }
+    Require(sceHttpSetRedirectCallback(connection, nullptr, nullptr) == 0);
+}
+
+struct CookieLog {
+    int context;
+    int connection;
+    int decision;
+    int action = 0;
+    int calls = 0;
+};
+
+static int APS5_VABI ReceiveCookie(int request, const char* url, const char* header, std::uint64_t length, void* argument) {
+    auto& log = *static_cast<CookieLog*>(argument);
+    ++log.calls;
+    Require(std::string(url).ends_with("/cookies/set"));
+    Require(std::string(header, length).find('=') != std::string::npos);
+    Require(sceHttpDeleteRequest(request) == static_cast<int>(0x80431021));
+    Require(sceHttpTerm_nid_postfix(log.context) == static_cast<int>(0x80431021));
+    if (log.action == 1) throw std::runtime_error("cookie callback test");
+    if (log.action == 2 && log.calls == 1) {
+        const int nested = Request(log.connection, "/cookies/check");
+        Require(sceHttpSendRequest(nested, nullptr, 0) == 0 && Read(nested).empty());
+        Require(sceHttpDeleteRequest(nested) == 0);
+    }
+    return log.decision;
+}
+
+static void CookieCallbacks(const char* url) {
+    for (int decision : {INT32_MIN, -1, 0, 1, INT32_MAX}) {
+        const int context = sceHttpInit_nid_postfix(0, 0, 65536);
+        const int object = sceHttpCreateTemplate(context, "cookie-callback", 2, 0);
+        CookieLog log{context, 0, decision};
+        Require(sceHttpSetCookieEnabled(object, 1) == 0);
+        Require(sceHttpSetCookieRecvCallback(object, ReceiveCookie, &log) == 0);
+        const int connection = sceHttpCreateConnectionWithURL(object, url, 0);
+        log.connection = connection;
+        log.action = 2;
+        int request = Request(connection, "/cookies/set");
+        Require(sceHttpSetCookieRecvCallback(connection, nullptr, nullptr) == 0);
+        Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+        Read(request);
+        Require(log.calls == 3);
+        Require(sceHttpDeleteRequest(request) == 0);
+        request = Request(connection, "/cookies/check");
+        Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+        Require(Read(request) == (decision < 0 ? "" : "session=alpha"));
+        Require(sceHttpDeleteRequest(request) == 0);
+        log.action = 1;
+        log.calls = 0;
+        request = Request(connection, "/cookies/set");
+        Require(sceHttpSetCookieRecvCallback(request, ReceiveCookie, &log) == 0);
+        Require(sceHttpSendRequest(request, nullptr, 0) == Network);
+        Require(log.calls == 1);
+        Require(sceHttpDeleteRequest(request) == 0);
+        log.action = 0;
+        log.calls = 0;
+        request = Request(connection, "/cookies/set");
+        Require(sceHttpSetCookieRecvCallback(request, ReceiveCookie, &log) == 0);
+        Require(sceHttpSetCookieEnabled(request, 0) == 0);
+        Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+        Read(request);
+        Require(log.calls == 0);
+        Require(sceHttpDeleteRequest(request) == 0);
+        Require(sceHttpDeleteConnection(connection) == 0 && sceHttpDeleteTemplate(object) == 0);
+        Require(sceHttpTerm_nid_postfix(context) == 0);
+    }
+}
+
+struct StatusLog {
+    int context = 0;
+    int connection = 0;
+    int action = 0;
+    int request = 0;
+    std::vector<int> phases;
+};
+
+static void APS5_VABI RequestStatus(int request, int phase, void* argument) {
+    auto& log = *static_cast<StatusLog*>(argument);
+    Require(phase >= 0 && phase <= 10);
+    Require(!log.request || request == log.request);
+    log.phases.push_back(phase);
+    Require(sceHttpDeleteRequest(request) == static_cast<int>(0x80431021));
+    Require(sceHttpSendRequest(request, nullptr, 0) == static_cast<int>(0x80431021));
+    char byte = 0;
+    Require(sceHttpReadData(request, &byte, 1) == static_cast<int>(0x80431021));
+    Require(sceHttpTerm_nid_postfix(log.context) == static_cast<int>(0x80431021));
+    if (phase == 10) {
+        int status = 0;
+        Require(sceHttpGetStatusCode(request, &status) == 0 && status == 200);
+    }
+    if (phase == 7 && log.action == 1) Require(sceHttpAbortRequest(request) == 0);
+    if (phase == 0 && log.action == 2) throw std::runtime_error("status callback test");
+    if (phase == 4 && log.action == 3) Require(sceHttpSetRequestStatusCallback(request, nullptr, nullptr) == 0);
+    if (phase == 7 && log.action == 4) {
+        const int nested = Request(log.connection, "/binary");
+        Require(sceHttpSetRequestStatusCallback(nested, nullptr, nullptr) == 0);
+        Require(sceHttpSendRequest(nested, nullptr, 0) == 0 && Read(nested).size() == 1024);
+        Require(sceHttpDeleteRequest(nested) == 0);
+    }
+}
+
+static void StatusCallbacks(int context, int connection, bool tls) {
+    if (tls) {
+        auto authority = Certificate(RootPem);
+        auto* pointer = &authority;
+        Require(sceHttpsLoadCert(context, 1, &pointer, nullptr, nullptr) == 0);
+    }
+    StatusLog log{context, connection};
+    Require(sceHttpSetRequestStatusCallback(connection, RequestStatus, &log) == 0);
+    int request = Request(connection, "/binary");
+    log.request = request;
+    Require(sceHttpSetRequestStatusCallback(connection, nullptr, nullptr) == 0);
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0 && Read(request).size() == 1024);
+    const std::vector<int> expected = tls ? std::vector<int>{0,1,2,3,4,5,6,7,8,9,10} : std::vector<int>{0,1,2,3,4,7,8,9,10};
+    if (log.phases != expected) {
+        for (int phase : log.phases) std::fprintf(stderr, "%d ", phase);
+        std::fprintf(stderr, "\n");
+    }
+    Require(log.phases == expected);
+    Require(sceHttpDeleteRequest(request) == 0);
+    for (int action = 1; action <= 4; ++action) {
+        log.phases.clear();
+        log.action = action;
+        request = Request(connection, "/binary");
+        log.request = request;
+        Require(sceHttpSetRequestStatusCallback(request, RequestStatus, &log) == 0);
+        const int result = sceHttpSendRequest(request, nullptr, 0);
+        Require(result == (action == 1 ? Aborted : action == 2 ? Network : 0));
+        if (action >= 3) Require(Read(request).size() == 1024);
+        if (action == 2) {
+            Require(log.phases == std::vector<int>{0});
+            int error = -1;
+            std::uint32_t detail = 1;
+            Require(sceHttpsGetSslError(request, &error, &detail) == 0 && error == 0 && detail == 0);
+        }
+        if (action == 3) Require(log.phases.back() == 4);
+        Require(sceHttpDeleteRequest(request) == 0);
+    }
+    log.phases.clear();
+    log.action = 0;
+    HttpEpollHandle epoll = nullptr;
+    Require(sceHttpCreateEpoll(context, &epoll) == 0);
+    request = Request(connection, "/binary");
+    log.request = request;
+    Require(sceHttpSetRequestStatusCallback(request, RequestStatus, &log) == 0);
+    Require(sceHttpSetNonblock(request, 1) == 0 && sceHttpSetEpoll(request, epoll, nullptr) == 0);
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(ReadAsync(request, epoll).size() == 1024);
+    Require(log.phases == expected);
+    Require(sceHttpDeleteRequest(request) == 0 && sceHttpDestroyEpoll(context, epoll) == 0);
+    log.phases.clear();
+    const std::string invalidHost(64, 'a');
+    const int failedTemplate = sceHttpCreateTemplate(context, "status-failure", 2, 0);
+    Require(failedTemplate > 0);
+    const int failedConnection = sceHttpCreateConnectionWithURL(
+        failedTemplate, ("http://" + invalidHost + ".invalid/").c_str(), 0);
+    Require(failedConnection > 0);
+    Require(sceHttpSetResolveTimeOut(failedConnection, 10000) == 0);
+    Require(sceHttpSetResolveRetry(failedConnection, 2) == 0);
+    request = Request(failedConnection, "/");
+    log.request = request;
+    Require(sceHttpSetRequestStatusCallback(request, RequestStatus, &log) == 0);
+    Require(sceHttpSendRequest(request, nullptr, 0) == Network);
+    Require(log.phases == std::vector<int>({0,1,0,1,0,1}));
+    Require(sceHttpDeleteRequest(request) == 0 && sceHttpDeleteConnection(failedConnection) == 0);
+    Require(sceHttpDeleteTemplate(failedTemplate) == 0);
+    if (tls) {
+        log.phases.clear();
+        Require(sceHttpsUnloadCert(context) == 0);
+        request = Request(connection, "/binary");
+        log.request = request;
+        Require(sceHttpSetRequestStatusCallback(request, RequestStatus, &log) == 0);
+        Require(sceHttpSendRequest(request, nullptr, 0) == Network);
+        Require(log.phases == std::vector<int>({0,1,2,3,4,5}));
+        Require(sceHttpDeleteRequest(request) == 0);
     }
 }
 
@@ -1014,6 +1284,9 @@ int main(int argc, char** argv) {
     else if (mode == "failures") Failures(connection);
     else if (mode == "session") Session(context, connection, argv[1]);
     else if (mode == "framing") Framing(connection);
+    else if (mode == "cookie_callbacks") CookieCallbacks(argv[1]);
+    else if (mode == "redirect_callbacks" || mode == "redirect_callbacks_tls") RedirectCallbacks(context, connection, mode == "redirect_callbacks_tls");
+    else if (mode == "status" || mode == "status_tls") StatusCallbacks(context, connection, mode == "status_tls");
     else if (mode == "authorities") Authorities();
     else if (mode == "auto_proxy") AutoProxy(context, argv[1]);
     else if (mode == "verification") Verification(argv[1]);

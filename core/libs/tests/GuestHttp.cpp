@@ -87,11 +87,8 @@ int main() {
     const int callbackConnection = sceHttpCreateConnectionWithURL(callbackTemplate, "http://127.0.0.1:1/", 0);
     const auto request = sceHttpCreateRequest2(callbackConnection, "GET", "/", 0);
     Require(sceHttpSetRequestStatusCallback(request, RequestStatusCallback, &callbackCount) == 0);
-    bool callbacksUnsupported = false;
-    try { sceHttpSendRequest(request, nullptr, 0); }
-    catch (const std::runtime_error&) { callbacksUnsupported = true; }
-    Require(callbacksUnsupported);
-    Require(callbackCount == 0);
+    Require(sceHttpSendRequest(request, nullptr, 0) == static_cast<int>(0x80431063u));
+    Require(callbackCount > 0);
     Require(sceHttpSetRequestStatusCallback(request, nullptr, nullptr) == 0);
     Require(sceHttpSetRequestStatusCallback(-1, RequestStatusCallback, &callbackCount) == static_cast<int>(0x80431100u));
     Require(sceHttpDeleteRequest(request) == 0);

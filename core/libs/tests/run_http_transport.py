@@ -30,6 +30,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     do_PUT = do_POST
     do_PATCH = do_POST
+    do_DELETE = do_POST
+    do_OPTIONS = do_POST
+    do_TRACE = do_POST
 
     def do_CONNECT(self):
         if self.path.startswith("rejected.invalid:"):
@@ -76,9 +79,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_response(code)
                 location = "/loop" if self.path == "/loop" else "http://127.0.0.1:9/" if self.path == "/downgrade" else "/method"
                 self.send_header("Location", location)
-                self.send_header("Content-Length", "7")
+                self.send_header("Content-Length", "0" if code == 304 else "7")
                 self.end_headers()
-                self.wfile.write(b"discard")
+                if code != 304:
+                    self.wfile.write(b"discard")
                 return
             if self.path.startswith("/started?"):
                 target = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)["path"][0]
@@ -179,7 +183,7 @@ if __name__ == "__main__":
 
     server = FixtureServer(("127.0.0.1", 0), Handler)
     server.upload_release = threading.Event()
-    secure = sys.argv[2] in ("tls", "mutual", "expired", "async_tls", "tunnel_tls", "verification", "sni", "minimum12", "minimum13")
+    secure = sys.argv[2] in ("tls", "mutual", "expired", "async_tls", "tunnel_tls", "verification", "sni", "minimum12", "minimum13", "status_tls", "redirect_callbacks_tls")
     if secure:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_3 if sys.argv[2] == "minimum13" else ssl.TLSVersion.TLSv1_2
@@ -200,7 +204,7 @@ if __name__ == "__main__":
         environment["http_proxy"] = "http://127.0.0.1:9"
         environment["ALL_PROXY"] = "http://127.0.0.1:9"
         environment["NO_PROXY"] = ""
-        host = "https://localhost" if secure else "http://127.0.0.1"
+        host = "https://localhost" if secure else "http://localhost" if sys.argv[2] == "status" else "http://127.0.0.1"
         result = subprocess.run([sys.argv[1], f"{host}:{server.server_port}/", sys.argv[2]], timeout=20, env=environment)
     finally:
         server.shutdown()

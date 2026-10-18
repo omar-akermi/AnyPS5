@@ -23,13 +23,6 @@
 #include <vector>
 
 static std::atomic<int> g_nextHandle{1};
-using HttpRequestStatusCallback = void (APS5_VABI *)(int, int, void*);
-struct RequestStatusRegistration {
-    HttpRequestStatusCallback callback;
-    void* argument;
-};
-static std::mutex g_statusMutex;
-static std::map<int, RequestStatusRegistration> g_statusCallbacks;
 
 
 #ifdef _WIN32
@@ -143,15 +136,6 @@ static void MarkDestroyed(HttpEpoll& epoll) {
 
 int HttpNextHandle_nid_no_patch() { return g_nextHandle.fetch_add(1, std::memory_order_relaxed); }
 
-void HttpForgetCallback_nid_no_patch(int id) {
-    std::lock_guard lock(g_statusMutex);
-    g_statusCallbacks.erase(id);
-}
-
-bool HttpHasCallback_nid_no_patch(int id) {
-    std::lock_guard lock(g_statusMutex);
-    return g_statusCallbacks.contains(id);
-}
 
 extern "C" {
 
@@ -287,14 +271,6 @@ int APS5_VABI sceHttpRedirectCacheFlush(int http_ctx_id) {
     return 0;
 }
 
-int APS5_VABI sceHttpSetRequestStatusCallback(int id, HttpRequestStatusCallback callback, void* argument) {
-    if (!HttpHasObject_nid_no_patch(id)) return ERROR_INVALID_ID;
-    std::lock_guard lock(g_statusMutex);
-    if (callback) g_statusCallbacks[id] = {callback, argument};
-    else g_statusCallbacks.erase(id);
-    return 0;
-}
-
 int APS5_VABI sceHttpParseResponseHeader(const char* header, std::size_t headerLen, const char* fieldStr,
                                        const char** fieldValue, std::size_t* valueLen) {
     constexpr int invalidResponse = static_cast<int>(0x80432060);
@@ -355,20 +331,6 @@ int APS5_VABI sceHttpParseResponseHeader(const char* header, std::size_t headerL
     *fieldValue = header + start;
     *valueLen = end - start;
     return static_cast<int>(consumed);
-}
-
-int APS5_VABI sceHttpSetCookieRecvCallback(int id, HttpCookieRecvCallback cbfunc, void* user_arg) {
-    if (!HttpHasObject_nid_no_patch(id)) return ERROR_INVALID_ID;
-    if (cbfunc) NotImplemented_nid_no_patch(__func__);
-    (void)user_arg;
-    return 0;
-}
-
-int APS5_VABI sceHttpSetRedirectCallback(int id, HttpRedirectCallback cbfunc, void* user_arg) {
-    if (!HttpHasObject_nid_no_patch(id)) return ERROR_INVALID_ID;
-    if (cbfunc) NotImplemented_nid_no_patch(__func__);
-    (void)user_arg;
-    return 0;
 }
 
 int APS5_VABI sceHttpAbortWaitRequest(HttpEpollHandle eh) {
