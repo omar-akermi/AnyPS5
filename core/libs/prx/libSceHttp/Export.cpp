@@ -30,10 +30,7 @@ struct RequestStatusRegistration {
 };
 static std::mutex g_statusMutex;
 static std::map<int, RequestStatusRegistration> g_statusCallbacks;
-struct HttpsCaList {
-    void* certs;
-    int certsNum;
-};
+
 
 #ifdef _WIN32
 struct HostMutex {
@@ -187,11 +184,10 @@ int APS5_VABI sceHttpDestroyEpoll(int http_ctx_id, HttpEpollHandle eh) {
 
 int APS5_VABI sceHttpInit_nid_postfix(int memid, int ssl_ctx_id, uint64_t pool_size) {
     (void)memid;
-    (void)ssl_ctx_id;
     (void)pool_size;
     const int id = g_nextHandle.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard lock(g_stateMutex);
-    HttpContextStarted_nid_no_patch(id);
+    HttpContextStarted_nid_no_patch(id, ssl_ctx_id);
     g_contexts.insert(id);
     return id;
 }
@@ -222,42 +218,17 @@ int APS5_VABI sceHttpSetEpoll(int id, HttpEpollHandle eh, void* user_arg) {
     return HttpBindEpoll_nid_no_patch(id, std::move(epoll), eh, user_arg);
 }
 
-int APS5_VABI sceHttpSetResolveRetry(int id, int32_t retry) {
-    if (HttpHasObject_nid_no_patch(id)) NotImplemented_nid_no_patch(__func__);
-    (void)id;
-    (void)retry;
-    return 0;
-}
 
-int APS5_VABI sceHttpSetResolveTimeOut(int id, uint32_t usec) {
-    if (HttpHasObject_nid_no_patch(id)) NotImplemented_nid_no_patch(__func__);
-    (void)id;
-    (void)usec;
-    return 0;
-}
 
-int APS5_VABI sceHttpSetSendTimeOut(int id, uint32_t usec) {
-    if (HttpHasObject_nid_no_patch(id)) NotImplemented_nid_no_patch(__func__);
-    (void)id;
-    (void)usec;
-    return 0;
-}
 
-int APS5_VABI sceHttpsSetSslCallback(int id, HttpsCallback cbfunc, void* user_arg) {
-    if (HttpHasObject_nid_no_patch(id) && cbfunc) NotImplemented_nid_no_patch(__func__);
-    (void)id;
-    (void)cbfunc;
-    (void)user_arg;
-    return 0;
-}
 
 int APS5_VABI sceHttpTerm_nid_postfix(int http_ctx_id) {
+    if (HttpInCallbackContext_nid_no_patch(http_ctx_id)) return ERROR_HTTP_BUSY;
     std::vector<std::shared_ptr<HttpEpoll>> epolls;
     {
         std::lock_guard lock(g_stateMutex);
         if (g_contexts.empty()) return ERROR_BEFORE_INIT;
         if (g_contexts.erase(http_ctx_id) == 0) return ERROR_INVALID_ID;
-        HttpContextStopped_nid_no_patch(http_ctx_id);
         for (auto it = g_epolls.begin(); it != g_epolls.end();) {
             if (it->second->Context() == http_ctx_id) {
                 epolls.push_back(std::move(it->second));
@@ -266,6 +237,7 @@ int APS5_VABI sceHttpTerm_nid_postfix(int http_ctx_id) {
         }
     }
     for (const auto& epoll : epolls) MarkDestroyed(*epoll);
+    HttpContextStopped_nid_no_patch(http_ctx_id);
     return 0;
 }
 
@@ -417,20 +389,5 @@ int APS5_VABI sceHttpAbortWaitRequest(HttpEpollHandle eh) {
     return 0;
 }
 
-int APS5_VABI sceHttpsGetCaList(int http_ctx_id, HttpsCaList* ca_list) {
-    if (HttpHasCertificates_nid_no_patch(http_ctx_id)) NotImplemented_nid_no_patch(__func__);
-    (void)http_ctx_id;
-    if (!ca_list) return ERROR_INVALID_VALUE;
-    ca_list->certs = nullptr;
-    ca_list->certsNum = 0;
-    return 0;
-}
 
-int APS5_VABI sceHttpsFreeCaList(int http_ctx_id, HttpsCaList* ca_list) {
-    (void)http_ctx_id;
-    if (!ca_list) return ERROR_INVALID_VALUE;
-    ca_list->certs = nullptr;
-    ca_list->certsNum = 0;
-    return 0;
-}
 }

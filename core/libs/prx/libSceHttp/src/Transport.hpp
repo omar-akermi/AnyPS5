@@ -20,11 +20,11 @@ int HttpBindEpoll_nid_no_patch(int id, std::shared_ptr<HttpEventSink> sink, Http
 int HttpGetEpoll_nid_no_patch(int id, HttpEpollHandle* handle, void** argument);
 
 int HttpNextHandle_nid_no_patch();
-void HttpContextStarted_nid_no_patch(int id);
+void HttpContextStarted_nid_no_patch(int id, int sslContext);
 void HttpContextStopped_nid_no_patch(int id);
 void HttpForgetCallback_nid_no_patch(int id);
 bool HttpHasCallback_nid_no_patch(int id);
 bool HttpHasObject_nid_no_patch(int id);
-bool HttpHasCertificates_nid_no_patch(int id);
+bool HttpInCallbackContext_nid_no_patch(int id);
 
 #endif

@@ -23,6 +23,7 @@ int APS5_VABI sceHttpCreateConnectionWithURL(int, const char*, int);
 int APS5_VABI sceHttpCreateRequest2(int, const char*, const char*, std::uint64_t);
 int APS5_VABI sceHttpCreateRequest(int, int, const char*, std::uint64_t);
 int APS5_VABI sceHttpCreateRequestWithURL2(int, const char*, const char*, std::uint64_t);
+int APS5_VABI sceHttpCreateRequestWithURL(int, int, const char*, std::uint64_t);
 int APS5_VABI sceHttpDeleteRequest(int);
 int APS5_VABI sceHttpDeleteConnection(int);
 int APS5_VABI sceHttpDeleteTemplate(int);
@@ -33,6 +34,9 @@ int APS5_VABI sceHttpGetStatusCode(int, int*);
 int APS5_VABI sceHttpGetAllResponseHeaders(int, char**, std::size_t*);
 int APS5_VABI sceHttpGetResponseContentLength(int, int*, std::uint64_t*);
 int APS5_VABI sceHttpSetRecvTimeOut(int, std::uint32_t);
+int APS5_VABI sceHttpSetResolveTimeOut(int, std::uint32_t);
+int APS5_VABI sceHttpSetSendTimeOut(int, std::uint32_t);
+int APS5_VABI sceHttpSetResolveRetry(int, std::int32_t);
 int APS5_VABI sceHttpSetResponseHeaderMaxSize(int, std::uint64_t);
 int APS5_VABI sceHttpSetRecvBlockSize(int, std::uint32_t);
 int APS5_VABI sceHttpAbortRequest(int);
@@ -56,6 +60,15 @@ int APS5_VABI sceHttpsGetSslError(int, int*, std::uint32_t*);
 int APS5_VABI sceHttpsDisableOption(int, std::uint32_t);
 int APS5_VABI sceHttpsEnableOption(int, std::uint32_t);
 int APS5_VABI sceHttpsSetSslVersion(int, int);
+int APS5_VABI sceHttpsSetSslCallback(int, HttpsCallback, void*);
+int APS5_VABI sceHttpsGetCaList(int, SceSsl::CaList*);
+int APS5_VABI sceHttpsFreeCaList(int, SceSsl::CaList*);
+int APS5_VABI sceSslInit_nid_postfix(std::uint64_t);
+int APS5_VABI sceSslTerm_nid_postfix(int);
+int APS5_VABI sceSslGetMemoryPoolStats(int, SceSsl::MemoryPoolStats*);
+void* APS5_VABI sceSslGetSubjectName(int, void*);
+int APS5_VABI sceSslGetNameEntryCount(int, void*);
+int APS5_VABI sceSslFreeSslCertName(int, void*);
 }
 
 static void Require(bool condition, const std::source_location location = std::source_location::current()) {
@@ -337,7 +350,7 @@ static void Tls(int context, int connection, const char* url, bool mutual) {
     Require(sceHttpSendRequest(request, nullptr, 0) == Network);
     int error = 0;
     std::uint32_t detail = 0;
-    Require(Unsupported([&] { sceHttpsGetSslError(request, &error, &detail); }));
+    Require(sceHttpsGetSslError(request, &error, &detail) == 0 && error == static_cast<int>(0x80435060) && (detail & 32));
     Require(sceHttpDeleteRequest(request) == 0);
     if (!mutual) {
         request = Request(connection, "/binary");
@@ -368,6 +381,10 @@ static void Tls(int context, int connection, const char* url, bool mutual) {
     Require(sceHttpsGetSslError(request, &error, &detail) == 0 && error == 0 && detail == 0);
     Require(sceHttpDeleteRequest(request) == 0);
     if (mutual) {
+        Require(sceHttpsLoadCert(context, 1, &pointer, nullptr, nullptr) == 0);
+        request = Request(connection, "/binary");
+        Require(sceHttpSendRequest(request, nullptr, 0) == 0 && Read(request).size() == 1024);
+        Require(sceHttpDeleteRequest(request) == 0);
         SceSsl::Data cert{const_cast<std::uint8_t*>(ClientDer.data()), ClientDer.size()};
         SceSsl::Data key{const_cast<std::uint8_t*>(ClientKeyDer.data()), ClientKeyDer.size()};
         Require(sceHttpsLoadCert(context, 1, &pointer, &cert, &key) == 0);
@@ -383,7 +400,7 @@ static void Tls(int context, int connection, const char* url, bool mutual) {
     wrongHost.replace(wrongHost.find("localhost"), 9, "127.0.0.1");
     request = sceHttpCreateRequestWithURL2(connection, "GET", wrongHost.c_str(), 0);
     Require(request > 0 && sceHttpSendRequest(request, nullptr, 0) == Network);
-    Require(Unsupported([&] { sceHttpsGetSslError(request, &error, &detail); }));
+    Require(sceHttpsGetSslError(request, &error, &detail) == 0 && error == static_cast<int>(0x80435060) && (detail & 4));
     Require(sceHttpDeleteRequest(request) == 0);
     request = sceHttpCreateRequestWithURL2(connection, "GET", wrongHost.c_str(), 0);
     Require(sceHttpsDisableOption(request, 4) == 0);
@@ -404,12 +421,34 @@ static void Expired(int context, int connection) {
     Require(sceHttpSendRequest(request, nullptr, 0) == Network);
     int error = 0;
     std::uint32_t detail = 0;
-    Require(Unsupported([&] { sceHttpsGetSslError(request, &error, &detail); }));
+    Require(sceHttpsGetSslError(request, &error, &detail) == 0 && error == static_cast<int>(0x80435060) && (detail & 8));
     Require(sceHttpDeleteRequest(request) == 0);
     request = Request(connection, "/binary");
     Require(sceHttpsDisableOption(request, 8) == 0);
     Require(sceHttpSendRequest(request, nullptr, 0) == 0);
     Require(Read(request).size() == 1024);
+    Require(sceHttpDeleteRequest(request) == 0);
+}
+
+static void Sni(int context, int connection, const char* url) {
+    auto authority = Certificate(RootPem);
+    auto* pointer = &authority;
+    Require(sceHttpsLoadCert(context, 1, &pointer, nullptr, nullptr) == 0);
+    int request = Request(connection, "/sni");
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0 && Read(request) == "localhost");
+    Require(sceHttpDeleteRequest(request) == 0);
+    request = Request(connection, "/sni");
+    Require(sceHttpsDisableOption(request, 0x80) == 0);
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0 && Read(request).empty());
+    Require(sceHttpDeleteRequest(request) == 0);
+    auto wrong = std::string(url);
+    wrong.replace(wrong.find("localhost"), 9, "127.0.0.1");
+    request = sceHttpCreateRequestWithURL2(connection, "GET", wrong.c_str(), 0);
+    Require(request > 0 && sceHttpsDisableOption(request, 0x80) == 0);
+    Require(sceHttpSendRequest(request, nullptr, 0) == Network);
+    int error = 0;
+    std::uint32_t detail = 0;
+    Require(sceHttpsGetSslError(request, &error, &detail) == 0 && (detail & 4));
     Require(sceHttpDeleteRequest(request) == 0);
 }
 
@@ -429,6 +468,299 @@ static std::string ReadAsync(int request, HttpEpollHandle epoll) {
             body.append(data, count);
         }
     }
+}
+
+static void Phases(int object, int connection, const char* url) {
+    Require(sceHttpSetResolveRetry(connection, -1) == InvalidValue);
+    Require(sceHttpSetResolveTimeOut(connection, 0) == InvalidValue);
+    Require(sceHttpSetSendTimeOut(connection, 0) == InvalidValue);
+    Require(sceHttpSetResolveRetry(-1, 1) == InvalidId);
+    Require(sceHttpSetResolveTimeOut(-1, 10000) == InvalidId);
+    Require(sceHttpSetSendTimeOut(-1, 10000) == InvalidId);
+    int request = Request(connection, "/slow");
+    Require(sceHttpSetSendTimeOut(request, 10000) == 0);
+    Require(sceHttpSetRecvTimeOut(request, 1000000) == 0);
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(Read(request) == std::string("hello\0world", 11));
+    Require(sceHttpDeleteRequest(request) == 0);
+    request = Request(connection, "/stall-upload", "POST", 16 * 1024 * 1024);
+    Require(sceHttpSetSendTimeOut(request, 20000) == 0);
+    Require(sceHttpSetRecvTimeOut(request, 1000000) == 0);
+    const std::string upload(16 * 1024 * 1024, 'u');
+    Require(sceHttpSendRequest(request, upload.data(), upload.size()) == Network);
+    Require(sceHttpDeleteRequest(request) == 0);
+    request = Request(connection, "/release-upload");
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Read(request);
+    Require(sceHttpDeleteRequest(request) == 0);
+    auto host = std::string(url);
+    host.replace(host.find("127.0.0.1"), 9, "localhost");
+    const int named = sceHttpCreateConnectionWithURL(object, host.c_str(), 0);
+    Require(named > 0);
+    Require(sceHttpSetResolveRetry(named, 2) == 0);
+    Require(sceHttpSetResolveTimeOut(named, 1000000) == 0);
+    request = Request(named, "/binary");
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(Read(request).size() == 1024);
+    Require(sceHttpDeleteRequest(request) == 0);
+    Require(sceHttpDeleteConnection(named) == 0);
+    host.replace(host.find("localhost"), 9, std::string(64, 'a') + ".invalid");
+    const int invalid = sceHttpCreateConnectionWithURL(object, host.c_str(), 0);
+    Require(invalid > 0);
+    Require(sceHttpSetResolveRetry(invalid, 2) == 0);
+    Require(sceHttpSetResolveTimeOut(invalid, 100000) == 0);
+    request = Request(invalid, "/binary");
+    Require(sceHttpSendRequest(request, nullptr, 0) == Network);
+    Require(sceHttpDeleteRequest(request) == 0);
+    Require(sceHttpDeleteConnection(invalid) == 0);
+}
+
+struct VerificationState {
+    int ssl;
+    int http;
+    int request = 0;
+    int calls = 0;
+    std::uint32_t errors = 0;
+    bool reject = false;
+    bool exception = false;
+    bool abort = false;
+    int connection = 0;
+    bool nested = false;
+};
+
+static int APS5_VABI NestedVerification(int, unsigned, void* const*, int, void* argument) {
+    auto& state = *static_cast<VerificationState*>(argument);
+    constexpr int busy = static_cast<int>(0x80431021);
+    Require(sceHttpDeleteRequest(state.request) == busy);
+    Require(sceHttpTerm_nid_postfix(state.http) == busy);
+    char byte;
+    Require(sceHttpReadData(state.request, &byte, 1) == busy);
+    Require(sceHttpSendRequest(state.request, nullptr, 0) == busy);
+    return 0;
+}
+
+static int APS5_VABI VerifyTls(int ssl, unsigned flags, void* const* certificates, int count, void* argument) {
+    auto& state = *static_cast<VerificationState*>(argument);
+    Require(ssl == state.ssl && count > 0 && certificates);
+    ++state.calls;
+    state.errors = flags;
+    for (int i = 0; i < count; ++i) {
+        void* name = sceSslGetSubjectName(ssl, certificates[i]);
+        Require(name && sceSslGetNameEntryCount(ssl, name) > 0);
+        Require(sceSslFreeSslCertName(ssl, name) == 0);
+    }
+    constexpr int busy = static_cast<int>(0x80431021);
+    Require(sceHttpDeleteRequest(state.request) == busy);
+    Require(sceHttpTerm_nid_postfix(state.http) == busy);
+    char byte;
+    Require(sceHttpReadData(state.request, &byte, 1) == busy);
+    int status = 0;
+    Require(sceHttpGetStatusCode(state.request, &status) < 0);
+    if (state.nested) {
+        const int request = Request(state.connection, "/binary");
+        Require(sceHttpSetNonblock(request, 0) == 0);
+        Require(sceHttpsSetSslCallback(request, NestedVerification, &state) == 0);
+        Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+        Require(Read(request).size() == 1024);
+        Require(sceHttpDeleteRequest(request) == 0);
+    }
+    if (state.abort) Require(sceHttpAbortRequest(state.request) == 0);
+    if (state.exception) throw std::runtime_error("TLS verification callback failure");
+    return state.reject ? -1 : 0;
+}
+
+static void Verification(const char* url) {
+    const int ssl = sceSslInit_nid_postfix(1048576);
+    const int http = sceHttpInit_nid_postfix(0, ssl, 65536);
+    const int object = sceHttpCreateTemplate(http, "verify callback", 2, 0);
+    VerificationState state{ssl, http};
+    Require(sceHttpsSetSslCallback(object, VerifyTls, &state) == 0);
+    const int connection = sceHttpCreateConnectionWithURL(object, url, 0);
+    int error = 0;
+    std::uint32_t detail = 0;
+    for (bool reject : {false, true}) {
+        state.reject = reject;
+        state.calls = 0;
+        state.request = Request(connection, "/binary");
+        Require(sceHttpSendRequest(state.request, nullptr, 0) == (reject ? Network : 0));
+        Require(state.calls == 1 && (state.errors & 32));
+        if (!reject) {
+            Require(Read(state.request).size() == 1024);
+            Require(sceHttpsGetSslError(state.request, &error, &detail) == 0 && error == 0 && detail == 0);
+        }
+        Require(sceHttpDeleteRequest(state.request) == 0);
+    }
+    auto authority = Certificate(RootPem);
+    auto* pointer = &authority;
+    Require(sceHttpsLoadCert(http, 1, &pointer, nullptr, nullptr) == 0);
+    state.reject = false;
+    state.exception = true;
+    state.request = Request(connection, "/binary");
+    Require(sceHttpSendRequest(state.request, nullptr, 0) == Network);
+    Require(sceHttpsGetSslError(state.request, &error, &detail) == 0 && error == static_cast<int>(0x80435063) && detail == 1);
+    Require(sceHttpDeleteRequest(state.request) == 0);
+    state.exception = false;
+    state.abort = true;
+    state.request = Request(connection, "/binary");
+    Require(sceHttpSendRequest(state.request, nullptr, 0) == Aborted);
+    Require(sceHttpDeleteRequest(state.request) == 0);
+    state.abort = false;
+    state.calls = 0;
+    state.connection = connection;
+    state.nested = true;
+    HttpEpollHandle epoll = nullptr;
+    Require(sceHttpCreateEpoll(http, &epoll) == 0);
+    Require(sceHttpSetNonblock(connection, 1) == 0);
+    Require(sceHttpSetEpoll(connection, epoll, nullptr) == 0);
+    state.request = Request(connection, "/binary");
+    Require(sceHttpSendRequest(state.request, nullptr, 0) == 0);
+    Require(ReadAsync(state.request, epoll).size() == 1024);
+    Require(state.calls == 1 && state.errors == 0);
+    Require(sceHttpDeleteRequest(state.request) == 0);
+    SceSsl::MemoryPoolStats stats{};
+    Require(sceSslGetMemoryPoolStats(ssl, &stats) == 0 && stats.currentInuseSize == 0);
+    Require(sceHttpTerm_nid_postfix(http) == 0);
+    Require(sceSslTerm_nid_postfix(ssl) == 0);
+}
+
+static void AutoProxy(int context, const char* url) {
+    Require(sceHttpCreateTemplate(context, "test", 2, 2) == InvalidValue);
+    const int object = sceHttpCreateTemplate(context, "test", 2, 1);
+    Require(object > 0);
+    const int connection = sceHttpCreateConnectionWithURL(object, url, 0);
+    Require(connection > 0);
+    const int request = Request(connection, "/binary");
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(Read(request).size() == 1024);
+    Require(sceHttpDeleteRequest(request) == 0);
+    Require(sceHttpDeleteConnection(connection) == 0);
+    Require(sceHttpDeleteTemplate(object) == 0);
+}
+
+static void Authorities() {
+    const int ssl = sceSslInit_nid_postfix(1048576);
+    const int http = sceHttpInit_nid_postfix(0, ssl, 65536);
+    Require(ssl > 0 && http > 0);
+    SceSsl::CaList list{};
+    Require(sceHttpsGetCaList(http, &list) == 0 && !list.certs && !list.num);
+    Require(sceHttpsGetCaList(http, nullptr) == InvalidValue);
+    Require(sceHttpsGetCaList(-1, &list) == InvalidId);
+    auto authority = Certificate(RootPem);
+    SceSsl::Data* authorities[] = {&authority, &authority};
+    Require(sceHttpsLoadCert(http, 2, authorities, nullptr, nullptr) == 0);
+    Require(sceHttpsGetCaList(http, &list) == 0 && list.certs && list.num == 2);
+    Require(sceHttpsLoadCert(http, 1, authorities, nullptr, nullptr) == 0);
+    SceSsl::CaList added{};
+    Require(sceHttpsGetCaList(http, &added) == 0 && added.num == 3);
+    Require(sceHttpsFreeCaList(http, &added) == 0);
+    for (int i = 0; i < list.num; ++i) {
+        void* name = sceSslGetSubjectName(ssl, list.certs[i]);
+        Require(name && sceSslGetNameEntryCount(ssl, name) > 0);
+        Require(sceSslFreeSslCertName(ssl, name) == 0);
+    }
+    SceSsl::MemoryPoolStats stats{};
+    Require(sceSslGetMemoryPoolStats(ssl, &stats) == 0 && stats.currentInuseSize > 0);
+    Require(sceHttpsUnloadCert(http) == 0);
+    void* name = sceSslGetSubjectName(ssl, list.certs[0]);
+    Require(name && sceSslFreeSslCertName(ssl, name) == 0);
+    auto wrong = list;
+    ++wrong.num;
+    Require(sceHttpsFreeCaList(http, &wrong) == InvalidValue);
+    const int other = sceHttpInit_nid_postfix(0, ssl, 65536);
+    Require(sceHttpsFreeCaList(other, &list) == InvalidValue);
+    Require(sceHttpTerm_nid_postfix(other) == 0);
+    Require(sceHttpsFreeCaList(http, &list) == 0 && !list.certs && !list.num);
+    Require(sceSslGetMemoryPoolStats(ssl, &stats) == 0 && stats.currentInuseSize == 0);
+    Require(sceHttpsLoadCert(http, 1, authorities, nullptr, nullptr) == 0);
+    Require(sceHttpsGetCaList(http, &list) == 0 && list.num == 1);
+    Require(sceHttpTerm_nid_postfix(http) == 0);
+    Require(sceSslGetMemoryPoolStats(ssl, &stats) == 0 && stats.currentInuseSize == 0);
+    Require(sceSslTerm_nid_postfix(ssl) == 0);
+}
+
+static void Framing(int connection) {
+    for (const char* name : {"Content-Length", "Transfer-Encoding"}) {
+        const int request = Request(connection, "/echo", "POST");
+        Require(sceHttpAddRequestHeader(request, name, std::strcmp(name, "Content-Length") == 0 ? "7, 7" : "ChUnKeD", 0) == 0);
+        Require(sceHttpSendRequest(request, "payload", 7) == 0);
+        Require(Read(request) == "payload");
+        Require(sceHttpDeleteRequest(request) == 0);
+    }
+    int request = Request(connection, "/echo", "POST");
+    Require(sceHttpAddRequestHeader(request, "Content-Length", "7", 0) == 0);
+    Require(sceHttpAddRequestHeader(request, "Content-Length", "7", 1) == 0);
+    Require(sceHttpSendRequest(request, "payload", 7) == 0);
+    Require(Read(request) == "payload");
+    Require(sceHttpDeleteRequest(request) == 0);
+    for (const char* value : {"", "8", "-1", "7,8", "7,", "18446744073709551616", "seven"}) {
+        request = Request(connection, "/echo", "POST", 7);
+        Require(sceHttpAddRequestHeader(request, "Content-Length", value, 0) == 0);
+        Require(sceHttpSendRequest(request, "payload", 7) == InvalidValue);
+        Require(sceHttpDeleteRequest(request) == 0);
+    }
+    for (const char* value : {"", "identity", "chunked,gzip", "chunked,chunked", "gzip,"}) {
+        request = Request(connection, "/echo", "POST", 7);
+        Require(sceHttpAddRequestHeader(request, "Transfer-Encoding", value, 0) == 0);
+        Require(sceHttpSendRequest(request, "payload", 7) == InvalidValue);
+        Require(sceHttpDeleteRequest(request) == 0);
+    }
+    request = Request(connection, "/echo", "POST", 7);
+    Require(sceHttpAddRequestHeader(request, "Content-Length", "7", 0) == 0);
+    Require(sceHttpAddRequestHeader(request, "Transfer-Encoding", "chunked", 0) == 0);
+    Require(sceHttpSendRequest(request, "payload", 7) == InvalidValue);
+    Require(sceHttpDeleteRequest(request) == 0);
+}
+
+static void Tunnel(int context, int connection, bool secure) {
+    if (secure) {
+        const int untrusted = Request(connection, "destination.invalid:443", "CONNECT");
+        Require(sceHttpSendRequest(untrusted, nullptr, 0) == Network);
+        Require(sceHttpDeleteRequest(untrusted) == 0);
+        auto authority = Certificate(RootPem);
+        auto* pointer = &authority;
+        Require(sceHttpsLoadCert(context, 1, &pointer, nullptr, nullptr) == 0);
+    }
+    Require(sceHttpCreateRequest2(connection, "CONNECT", "bad/target:443", 0) == static_cast<int>(0x80433060));
+    Require(sceHttpCreateRequest2(connection, "CONNECT", "target.invalid:0", 0) == static_cast<int>(0x80433060));
+    Require(sceHttpCreateRequest2(connection, "CONNECT", "target.invalid:443", 1) == InvalidValue);
+    for (int i = 0; i < 4; ++i) {
+        const int request = i == 0 ? sceHttpCreateRequest2(connection, "CONNECT", "destination.invalid:443", 0) :
+            i == 1 ? sceHttpCreateRequest(connection, 7, "destination.invalid:443", 0) :
+            i == 2 ? sceHttpCreateRequestWithURL2(connection, "CONNECT", "https://destination.invalid/path", 0) :
+                     sceHttpCreateRequestWithURL(connection, 7, "https://destination.invalid/path", 0);
+        Require(request > 0);
+        Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+        int status = 0;
+        Require(sceHttpGetStatusCode(request, &status) == 0 && status == 200);
+        char* headers = nullptr;
+        std::size_t headerSize = 0;
+        Require(sceHttpGetAllResponseHeaders(request, &headers, &headerSize) == 0);
+        Require(std::string(headers, headerSize).find("X-Tunnel-Target: destination.invalid:443") != std::string::npos);
+        int result = 0;
+        std::uint64_t length = 123;
+        Require(sceHttpGetResponseContentLength(request, &result, &length) == 0 && result == static_cast<int>(0x80431071));
+        const auto bytes = Read(request);
+        Require(bytes.size() == 65536);
+        for (std::size_t n = 0; n < bytes.size(); ++n) Require(static_cast<unsigned char>(bytes[n]) == n % 256);
+        Require(sceHttpDeleteRequest(request) == 0);
+    }
+    int request = Request(connection, "rejected.invalid:443", "CONNECT");
+    Require(sceHttpSendRequest(request, nullptr, 0) == Network);
+    if (secure) {
+        int error = 0;
+        std::uint32_t detail = 1;
+        Require(sceHttpsGetSslError(request, &error, &detail) == 0 && error == static_cast<int>(0x80435064) && detail == 0);
+    }
+    Require(sceHttpDeleteRequest(request) == 0);
+    HttpEpollHandle epoll = nullptr;
+    Require(sceHttpCreateEpoll(context, &epoll) == 0);
+    Require(sceHttpSetEpoll(connection, epoll, nullptr) == 0);
+    Require(sceHttpSetNonblock(connection, 1) == 0);
+    request = Request(connection, "destination.invalid:443", "CONNECT");
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+    Require(ReadAsync(request, epoll).size() == 65536);
+    Require(sceHttpDeleteRequest(request) == 0);
+    Require(sceHttpDestroyEpoll(context, epoll) == 0);
 }
 
 static void AsyncTls(int context, int connection) {
@@ -648,10 +980,17 @@ int main(int argc, char** argv) {
     else if (mode == "streaming") Streaming(connection);
     else if (mode == "failures") Failures(connection);
     else if (mode == "session") Session(context, connection, argv[1]);
+    else if (mode == "framing") Framing(connection);
+    else if (mode == "authorities") Authorities();
+    else if (mode == "auto_proxy") AutoProxy(context, argv[1]);
+    else if (mode == "verification") Verification(argv[1]);
+    else if (mode == "phases") Phases(object, connection, argv[1]);
+    else if (mode == "tunnel" || mode == "tunnel_tls") Tunnel(context, connection, mode == "tunnel_tls");
     else if (mode == "async") Async(context, connection, argv[1]);
     else if (mode == "async_tls") AsyncTls(context, connection);
     else if (mode == "tls" || mode == "mutual") Tls(context, connection, argv[1], mode == "mutual");
     else if (mode == "expired") Expired(context, connection);
+    else if (mode == "sni") Sni(context, connection, argv[1]);
     else if (mode == "lifecycle") { Lifecycle(context, connection); return 0; }
     else if (mode == "contexts") { Contexts(context, connection, argv[1]); return 0; }
     else Require(false);

@@ -32,3 +32,7 @@ static_assert(sizeof(CaList) == 0x10);
 static_assert(sizeof(MemoryPoolStats) == 0x20);
 
 }
+
+extern "C" int SslImportCaList_nid_no_patch(int context, const SceSsl::Data* input, SceSsl::CaList* output);
+extern "C" void SslReleaseCaList_nid_no_patch(int context, SceSsl::CaList list);
+extern "C" bool SslContextExists_nid_no_patch(int context);

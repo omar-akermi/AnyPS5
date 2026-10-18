@@ -74,7 +74,7 @@ static void CheckUriEscapeBytes() {
     }
 }
 
-static int AuthInfo(int, int, const char*, char*, char*, int, std::uint8_t**, std::uint64_t*, int*, void*) { std::abort(); }
+static int APS5_VABI AuthInfo(int, int, const char*, char*, char*, int, std::uint8_t**, std::uint64_t*, int*, void*) { std::abort(); }
 static void APS5_VABI RequestStatusCallback(int, int, void* argument) {
     ++*static_cast<int*>(argument);
 }

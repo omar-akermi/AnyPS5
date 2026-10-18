@@ -31,8 +31,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
     do_PUT = do_POST
     do_PATCH = do_POST
 
+    def do_CONNECT(self):
+        if self.path.startswith("rejected.invalid:"):
+            self.send_error(403)
+            return
+        try:
+            self.send_response(200)
+            self.send_header("X-Tunnel-Target", self.path)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            self.wfile.write(bytes(range(256)) * 256)
+            self.wfile.flush()
+            if isinstance(self.connection, ssl.SSLSocket):
+                self.connection.settimeout(2)
+                self.connection.unwrap().close()
+        except ConnectionError:
+            pass
+        self.close_connection = True
+
     def upload(self):
-        if self.headers.get("Transfer-Encoding") != "chunked":
+        if self.headers.get("Transfer-Encoding", "").lower() != "chunked":
             return self.rfile.read(int(self.headers.get("Content-Length", 0)))
         chunks = []
         while True:
@@ -46,6 +64,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def respond(self):
         try:
+            if self.path == "/stall-upload":
+                self.server.upload_release.wait(3)
+            if self.path == "/release-upload":
+                self.server.upload_release.set()
             with self.server.started_lock:
                 self.server.started.add(self.path)
             if self.path.startswith("/redirect/") or self.path in ("/loop", "/downgrade"):
@@ -86,12 +108,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 data = self.command.encode() + b":" + self.rfile.read(int(self.headers.get("Content-Length", 0)))
             elif self.path in ("/cookies/check", "/outside-cookie"):
                 data = self.headers.get("Cookie", "").encode()
-            elif self.path == "/echo":
+            elif self.path in ("/echo", "/stall-upload"):
                 data = self.upload()
             elif self.path == "/binary":
                 data = bytes(range(256)) * 4
             elif self.path == "/missing":
                 data = b"missing"
+            elif self.path == "/sni":
+                data = (getattr(self.connection, "http_sni", None) or "").encode()
             else:
                 data = b"hello\x00world"
             self.send_response(404 if self.path == "/missing" else 200)
@@ -126,7 +150,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         self.wfile.write(chunk)
                 else:
                     self.wfile.write(data)
-        except (BrokenPipeError, ConnectionResetError):
+        except ConnectionError:
+            pass
+
+
+class FixtureServer(http.server.ThreadingHTTPServer):
+    request_queue_size = 64
+    tls_context = None
+
+    def finish_request(self, request, address):
+        if self.tls_context is None:
+            return super().finish_request(request, address)
+        try:
+            with self.tls_context.wrap_socket(request, server_side=True) as connection:
+                super().finish_request(connection, address)
+        except (ssl.SSLError, ConnectionError):
             pass
 
 
@@ -139,19 +177,20 @@ if __name__ == "__main__":
         target.write_text(contents, encoding="ascii")
         return str(target)
 
-    http.server.ThreadingHTTPServer.request_queue_size = 64
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    secure = sys.argv[2] in ("tls", "mutual", "expired", "async_tls")
+    server = FixtureServer(("127.0.0.1", 0), Handler)
+    server.upload_release = threading.Event()
+    secure = sys.argv[2] in ("tls", "mutual", "expired", "async_tls", "tunnel_tls", "verification", "sni")
     if secure:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.maximum_version = ssl.TLSVersion.TLSv1_2
+        context.set_servername_callback(lambda connection, name, _: setattr(connection, "http_sni", name))
         context.load_cert_chain(certificate("ExpiredPem" if sys.argv[2] == "expired" else "ServerPem", "HttpTlsFixture.hpp"),
                                 certificate("ServerKey", "HttpTlsFixture.hpp"))
         if sys.argv[2] == "mutual":
             context.verify_mode = ssl.CERT_REQUIRED
             context.load_verify_locations(certificate("RootPem", "SslCertificateFixture.hpp"))
-        server.socket = context.wrap_socket(server.socket, server_side=True)
+        server.tls_context = context
     server.started = set()
     server.started_lock = threading.Lock()
     worker = threading.Thread(target=server.serve_forever, daemon=True)

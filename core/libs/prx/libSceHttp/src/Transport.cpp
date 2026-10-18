@@ -15,6 +15,7 @@
 #include <climits>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -22,6 +23,9 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+extern "C" int APS5_VABI sceNetCtlGetInfo(int code, NetCtlInfo* info);
+extern "C" int __real_mbedtls_ssl_set_hostname(mbedtls_ssl_context* context, const char* hostname);
 
 namespace {
 
@@ -32,6 +36,9 @@ struct Settings {
     long version = CURL_HTTP_VERSION_1_1;
     std::uint32_t connectTimeout = 30000000;
     std::uint32_t receiveTimeout = 30000000;
+    std::uint32_t resolveTimeout = 30000000;
+    std::uint32_t sendTimeout = 30000000;
+    int resolveRetry = 0;
     std::size_t headerLimit = 16384;
     std::size_t readBlock = INT_MAX;
     bool keepAlive = false;
@@ -40,6 +47,9 @@ struct Settings {
     bool inflate = true;
     bool chunked = false;
     bool nonblock = false;
+    bool autoProxy = false;
+    HttpsCallback sslCallback = nullptr;
+    void* sslArgument = nullptr;
     std::shared_ptr<HttpEventSink> epoll;
     HttpEpollHandle epollHandle = nullptr;
     void* epollArgument = nullptr;
@@ -64,10 +74,22 @@ struct Transfer {
     bool location = false;
     bool discard = false;
     bool paused = false;
+    bool tunnel = false;
+    bool resolving = false;
+    bool sending = false;
+    bool sent = false;
+    bool retrying = false;
+    int resolveRetries = 0;
+    curl_off_t lookupBaseline = 0;
+    curl_off_t sendBaseline = 0;
+    std::chrono::steady_clock::time_point resolveStarted;
+    std::chrono::steady_clock::time_point sendStarted;
     int status = 0;
     int error = 0;
     int nativeError = 0;
     std::uint32_t verifyError = 0;
+    std::exception_ptr callbackError;
+    std::string peerHostname;
     std::size_t headerLimit = 0;
     std::string headers;
     std::vector<char> body;
@@ -108,11 +130,15 @@ struct Object {
     int id = 0;
     int parent = 0;
     int context = 0;
+    int sslContext = 0;
+    std::map<void*, SceSsl::CaList> caLists;
     Settings settings;
     std::string url;
     std::string method;
+    std::string proxy;
     std::uint64_t contentLength = 0;
-    std::mutex mutex;
+    std::recursive_mutex mutex;
+    std::atomic<unsigned> callbacks{0};
     std::atomic<bool> aborted{false};
     std::shared_ptr<CookieStore> cookieStore;
     std::shared_ptr<Object> root;
@@ -121,7 +147,11 @@ struct Object {
     std::jthread worker;
 
     explicit Object(Kind value) : kind(value) {}
-    ~Object() { aborted = true; *eventAlive = false; }
+    ~Object() {
+        aborted = true;
+        *eventAlive = false;
+        for (const auto& [pointer, list] : caLists) SslReleaseCaList_nid_no_patch(sslContext, list);
+    }
 };
 
 struct ParsedCertificate {
@@ -129,15 +159,101 @@ struct ParsedCertificate {
     ~ParsedCertificate() { mbedtls_x509_crt_free(&value); }
 };
 
-int VerifyCertificate(void* argument, mbedtls_x509_crt*, int, std::uint32_t* flags) {
+struct CallbackScope;
+thread_local CallbackScope* activeCallback = nullptr;
+thread_local Object* activeRequest = nullptr;
+
+struct TransferScope {
+    Object* previous = activeRequest;
+    explicit TransferScope(Object& request) { activeRequest = &request; }
+    ~TransferScope() { activeRequest = previous; }
+};
+
+struct CallbackScope {
+    CallbackScope* previous = activeCallback;
+    Object& object;
+    explicit CallbackScope(Object& value) : object(value) {
+        ++object.callbacks;
+        ++object.root->callbacks;
+        activeCallback = this;
+    }
+    ~CallbackScope() {
+        activeCallback = previous;
+        --object.root->callbacks;
+        --object.callbacks;
+    }
+};
+
+bool InCallback(int id) {
+    for (auto* scope = activeCallback; scope; scope = scope->previous)
+        if (scope->object.id == id) return true;
+    return false;
+}
+
+std::uint32_t VerificationBits(std::uint32_t flags) {
+    std::uint32_t result = 0;
+    if (flags & MBEDTLS_X509_BADCERT_CN_MISMATCH) result |= 4;
+    if (flags & MBEDTLS_X509_BADCERT_EXPIRED) result |= 8;
+    if (flags & MBEDTLS_X509_BADCERT_FUTURE) result |= 16;
+    if (flags & MBEDTLS_X509_BADCERT_NOT_TRUSTED) result |= 32;
+    if (flags & ~(MBEDTLS_X509_BADCERT_CN_MISMATCH | MBEDTLS_X509_BADCERT_EXPIRED |
+                  MBEDTLS_X509_BADCERT_FUTURE | MBEDTLS_X509_BADCERT_NOT_TRUSTED)) result |= 2;
+    return result;
+}
+
+int VerifyCertificate(void* argument, mbedtls_x509_crt* certificate, int depth, std::uint32_t* flags) noexcept {
     auto& request = *static_cast<Object*>(argument);
     const auto options = request.settings.verify;
+    if (!depth && !(options & 0x80) && (options & 4)) {
+        std::uint32_t nameFlags = 0;
+        const int result = mbedtls_x509_crt_verify(certificate, nullptr, nullptr,
+            request.transfer->peerHostname.c_str(), &nameFlags, nullptr, nullptr);
+        if (result != 0 && result != MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
+            request.transfer->verifyError |= MBEDTLS_X509_BADCERT_OTHER;
+            return MBEDTLS_ERR_X509_FATAL_ERROR;
+        }
+        *flags |= nameFlags & MBEDTLS_X509_BADCERT_CN_MISMATCH;
+    }
     if (!(options & 0x01)) *flags = 0;
     if (!(options & 0x04)) *flags &= ~MBEDTLS_X509_BADCERT_CN_MISMATCH;
     if (!(options & 0x08)) *flags &= ~MBEDTLS_X509_BADCERT_EXPIRED;
     if (!(options & 0x10)) *flags &= ~MBEDTLS_X509_BADCERT_FUTURE;
     if (!(options & 0x20)) *flags &= ~MBEDTLS_X509_BADCERT_NOT_TRUSTED;
     request.transfer->verifyError |= *flags;
+    if (request.settings.sslCallback) {
+        *flags = 0;
+        if (depth) return 0;
+        SceSsl::CaList chain{};
+        try {
+            std::string pem;
+            for (const auto* entry = certificate; entry && entry->raw.p; entry = entry->next) {
+                std::size_t length = 0;
+                mbedtls_pem_write_buffer("-----BEGIN CERTIFICATE-----\n", "-----END CERTIFICATE-----\n",
+                    entry->raw.p, entry->raw.len, nullptr, 0, &length);
+                std::vector<unsigned char> encoded(length);
+                if (mbedtls_pem_write_buffer("-----BEGIN CERTIFICATE-----\n", "-----END CERTIFICATE-----\n",
+                    entry->raw.p, entry->raw.len, encoded.data(), encoded.size(), &length) != 0)
+                    return MBEDTLS_ERR_X509_FATAL_ERROR;
+                pem.append(reinterpret_cast<char*>(encoded.data()), length - 1);
+            }
+            SceSsl::Data input{reinterpret_cast<std::uint8_t*>(pem.data()), pem.size() + 1};
+            if (SslImportCaList_nid_no_patch(request.root->sslContext, &input, &chain) != 0)
+                return MBEDTLS_ERR_X509_FATAL_ERROR;
+            CallbackScope scope(request);
+            const int result = request.settings.sslCallback(request.root->sslContext, VerificationBits(request.transfer->verifyError),
+                chain.certs, chain.num, request.settings.sslArgument);
+            SslReleaseCaList_nid_no_patch(request.root->sslContext, chain);
+            if (result || request.aborted) {
+                if (!request.transfer->verifyError) request.transfer->verifyError = MBEDTLS_X509_BADCERT_OTHER;
+                return MBEDTLS_ERR_X509_CERT_VERIFY_FAILED;
+            }
+            request.transfer->verifyError = 0;
+        } catch (...) {
+            if (chain.certs) SslReleaseCaList_nid_no_patch(request.root->sslContext, chain);
+            request.transfer->callbackError = std::current_exception();
+            return MBEDTLS_ERR_X509_FATAL_ERROR;
+        }
+    }
     return 0;
 }
 
@@ -210,6 +326,53 @@ bool Field(std::string_view text) {
     return std::none_of(text.begin(), text.end(), [](unsigned char c) { return (c < 32 && c != '\t') || c == 127; });
 }
 
+std::string_view Trim(std::string_view value) {
+    while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.remove_prefix(1);
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) value.remove_suffix(1);
+    return value;
+}
+
+int Framing(const Object& request, std::size_t size, bool& chunked, bool& length, std::string& encoding) {
+    for (const auto& [name, value] : request.settings.headers) {
+        if (EqualName(name, "Content-Length")) {
+            auto values = std::string_view(value);
+            for (;;) {
+                const auto comma = values.find(',');
+                const auto item = Trim(values.substr(0, comma));
+                std::uint64_t declared = 0;
+                const auto parsed = std::from_chars(item.data(), item.data() + item.size(), declared);
+                if (item.empty() || parsed.ec != std::errc{} || parsed.ptr != item.data() + item.size() || declared != size)
+                    return ERROR_INVALID_VALUE;
+                length = true;
+                if (comma == std::string_view::npos) break;
+                values.remove_prefix(comma + 1);
+            }
+        }
+        if (EqualName(name, "Transfer-Encoding")) {
+            if (!encoding.empty()) encoding += ',';
+            if (Trim(value).empty()) return ERROR_INVALID_VALUE;
+            encoding += value;
+        }
+    }
+    if (!encoding.empty()) {
+        auto values = std::string_view(encoding);
+        bool found = false;
+        for (;;) {
+            const auto comma = values.find(',');
+            const auto item = Trim(values.substr(0, comma));
+            if (item.empty() || found) return ERROR_INVALID_VALUE;
+            found = EqualName(item, "chunked");
+            if (comma == std::string_view::npos) break;
+            values.remove_prefix(comma + 1);
+        }
+        if (!found) return ERROR_INVALID_VALUE;
+        chunked = true;
+    }
+    if ((length && chunked) || (chunked && request.settings.version == CURL_HTTP_VERSION_1_0)) return ERROR_INVALID_VALUE;
+    if (!chunked && !length && size != request.contentLength) return ERROR_INVALID_VALUE;
+    return 0;
+}
+
 std::string NormalizeUrl(const char* text, bool originOnly) {
     if (!text || !InitializeCurl()) return {};
     std::unique_ptr<CURLU, decltype(&curl_url_cleanup)> url(curl_url(), curl_url_cleanup);
@@ -231,23 +394,66 @@ std::string NormalizeUrl(const char* text, bool originOnly) {
 }
 
 const char* Method(int method) {
-    constexpr const char* methods[] = {"GET", "POST", "HEAD", "OPTIONS", "PUT", "DELETE", "TRACE"};
-    return method >= 0 && method < 7 ? methods[method] : nullptr;
+    constexpr const char* methods[] = {"GET", "POST", "HEAD", "OPTIONS", "PUT", "DELETE", "TRACE", "CONNECT"};
+    return method >= 0 && method < 8 ? methods[method] : nullptr;
+}
+
+int ProxyConfiguration(std::string& proxy) {
+    NetCtlInfo info{};
+    if (sceNetCtlGetInfo(19, &info) != 0) return ERROR_NETWORK;
+    std::uint32_t mode = 0;
+    std::memcpy(&mode, info.opaque, sizeof(mode));
+    if (!mode) return 0;
+    if (mode != 1) return ERROR_INVALID_VALUE;
+    if (sceNetCtlGetInfo(20, &info) != 0) return ERROR_NETWORK;
+    const auto* end = static_cast<const std::uint8_t*>(std::memchr(info.opaque, 0, sizeof(info.opaque)));
+    if (!end || end == info.opaque) return ERROR_INVALID_VALUE;
+    std::string host(reinterpret_cast<const char*>(info.opaque), static_cast<std::size_t>(end - info.opaque));
+    if (host.find(':') != std::string::npos && !host.starts_with('[')) host = '[' + host + ']';
+    if (sceNetCtlGetInfo(21, &info) != 0) return ERROR_NETWORK;
+    std::uint16_t port = 0;
+    std::memcpy(&port, info.opaque, sizeof(port));
+    if (!port) return ERROR_INVALID_VALUE;
+    proxy = NormalizeUrl(("http://" + host + ':' + std::to_string(port) + '/').c_str(), true);
+    return proxy.empty() ? ERROR_INVALID_VALUE : 0;
+}
+
+std::string TunnelUrl(const char* text, bool absolute) {
+    if (!absolute && (std::strpbrk(text, "/?#@\\") || !std::strchr(text, ':'))) return {};
+    const auto input = absolute ? std::string(text) : "http://" + std::string(text) + '/';
+    const auto normalized = NormalizeUrl(input.c_str(), true);
+    if (normalized.empty()) return {};
+    std::unique_ptr<CURLU, decltype(&curl_url_cleanup)> url(curl_url(), curl_url_cleanup);
+    if (!url || curl_url_set(url.get(), CURLUPART_URL, normalized.c_str(), 0) != CURLUE_OK) return {};
+    char* host = nullptr;
+    char* port = nullptr;
+    if (curl_url_get(url.get(), CURLUPART_HOST, &host, 0) != CURLUE_OK) return {};
+    const auto result = curl_url_get(url.get(), CURLUPART_PORT, &port, absolute ? CURLU_DEFAULT_PORT : 0);
+    std::string output;
+    if (result == CURLUE_OK && std::strcmp(port, "0") != 0) output = "http://" + std::string(host) + ':' + port + '/';
+    curl_free(host);
+    curl_free(port);
+    return output;
 }
 
 int NewRequest(int connection, const char* method, const char* location, std::uint64_t length, bool absolute) {
     auto parent = Find(connection, Kind::Connection);
     if (!parent) return ERROR_INVALID_ID;
     if (!method || !location || !Token(method)) return ERROR_INVALID_VALUE;
-    if (EqualName(method, "CONNECT")) NotImplemented_nid_no_patch("HTTP CONNECT requests");
     auto request = std::make_shared<Object>(Kind::Request);
     {
         std::lock_guard lock(parent->mutex);
         request->settings = parent->settings;
         request->context = parent->context;
-        if (!absolute && location[0] != '/') return ERROR_INVALID_URL;
-        const auto url = absolute ? std::string(location) : parent->url.substr(0, parent->url.size() - 1) + location;
-        request->url = NormalizeUrl(url.c_str(), false);
+        if (EqualName(method, "CONNECT")) {
+            if (length) return ERROR_INVALID_VALUE;
+            request->url = TunnelUrl(location, absolute);
+            request->proxy = parent->url;
+        } else {
+            if (!absolute && location[0] != '/') return ERROR_INVALID_URL;
+            const auto url = absolute ? std::string(location) : parent->url.substr(0, parent->url.size() - 1) + location;
+            request->url = NormalizeUrl(url.c_str(), false);
+        }
     }
     if (request->url.empty()) return ERROR_INVALID_URL;
     request->parent = connection;
@@ -306,17 +512,103 @@ std::size_t Body(char* bytes, std::size_t size, std::size_t count, void* argumen
     }
 }
 
+int ResolverStarted(void*, void*, void* argument) noexcept {
+    auto& transfer = *static_cast<Transfer*>(argument);
+    transfer.resolving = true;
+    transfer.resolveStarted = std::chrono::steady_clock::now();
+    curl_easy_getinfo(transfer.easy, CURLINFO_NAMELOOKUP_TIME_T, &transfer.lookupBaseline);
+    if (!transfer.retrying) transfer.resolveRetries = 0;
+    transfer.retrying = false;
+    return 0;
+}
+
+int SendStarted(void* argument, char*, char*, int, int) noexcept {
+    auto& transfer = *static_cast<Transfer*>(argument);
+    transfer.resolving = false;
+    transfer.sending = true;
+    transfer.sent = false;
+    transfer.sendStarted = std::chrono::steady_clock::now();
+    curl_easy_getinfo(transfer.easy, CURLINFO_POSTTRANSFER_TIME_T, &transfer.sendBaseline);
+    return CURL_PREREQFUNC_OK;
+}
+
+int RetryResolve(Object& request) {
+    auto& transfer = *request.transfer;
+    if (transfer.resolveRetries >= request.settings.resolveRetry) return transfer.error = ERROR_NETWORK;
+    ++transfer.resolveRetries;
+    if (curl_multi_remove_handle(transfer.multi, transfer.easy) != CURLM_OK) return transfer.error = ERROR_NETWORK;
+    transfer.attached = false;
+    transfer.resolving = false;
+    transfer.sending = false;
+    transfer.sent = false;
+    transfer.done = false;
+    transfer.nativeError = 0;
+    transfer.error = 0;
+    transfer.retrying = true;
+    if (curl_multi_add_handle(transfer.multi, transfer.easy) != CURLM_OK) return transfer.error = ERROR_NETWORK;
+    transfer.attached = true;
+    return 0;
+}
+
 int Pump(Object& request) {
+    TransferScope scope(request);
     auto& transfer = *request.transfer;
     if (request.aborted) return transfer.error = ERROR_ABORTED;
+    if (transfer.tunnel) {
+        if (transfer.done || transfer.consumed < transfer.body.size()) return transfer.error;
+        transfer.body.resize(CURL_MAX_WRITE_SIZE);
+        std::size_t size = 0;
+        const auto result = curl_easy_recv(transfer.easy, transfer.body.data(), transfer.body.size(), &size);
+        transfer.body.resize(size);
+        transfer.consumed = 0;
+        if (result != CURLE_OK && result != CURLE_AGAIN) {
+            transfer.nativeError = result;
+            return transfer.error = ERROR_NETWORK;
+        }
+        if (result == CURLE_OK && !size) transfer.done = true;
+        return transfer.error;
+    }
     int running = 0;
     if (curl_multi_perform(transfer.multi, &running) != CURLM_OK) return transfer.error = ERROR_NETWORK;
+    if (request.aborted) return transfer.error = ERROR_ABORTED;
+    if (transfer.callbackError) {
+        transfer.error = ERROR_NETWORK;
+        return transfer.error;
+    }
     int remaining = 0;
     while (auto* message = curl_multi_info_read(transfer.multi, &remaining)) {
         if (message->msg == CURLMSG_DONE) {
             transfer.done = true;
             transfer.nativeError = message->data.result;
+            if (message->data.result == CURLE_COULDNT_RESOLVE_HOST || message->data.result == CURLE_COULDNT_RESOLVE_PROXY)
+                return RetryResolve(request);
             if (message->data.result != CURLE_OK && !transfer.error) transfer.error = ERROR_NETWORK;
+            if (!request.proxy.empty() && !transfer.error) {
+                transfer.tunnel = true;
+                transfer.done = false;
+                transfer.sent = true;
+            }
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (transfer.resolving) {
+        curl_off_t elapsed = 0;
+        curl_easy_getinfo(transfer.easy, CURLINFO_NAMELOOKUP_TIME_T, &elapsed);
+        if (elapsed > transfer.lookupBaseline) transfer.resolving = false;
+        else if (now - transfer.resolveStarted >= std::chrono::microseconds(request.settings.resolveTimeout)) {
+            transfer.nativeError = CURLE_OPERATION_TIMEDOUT;
+            return RetryResolve(request);
+        }
+    }
+    if (transfer.sending) {
+        curl_off_t elapsed = 0;
+        curl_easy_getinfo(transfer.easy, CURLINFO_POSTTRANSFER_TIME_T, &elapsed);
+        if (elapsed > transfer.sendBaseline || transfer.ready) {
+            transfer.sending = false;
+            transfer.sent = true;
+        } else if (now - transfer.sendStarted >= std::chrono::microseconds(request.settings.sendTimeout)) {
+            transfer.nativeError = CURLE_OPERATION_TIMEDOUT;
+            return transfer.error = ERROR_NETWORK;
         }
     }
     return transfer.error;
@@ -350,6 +642,7 @@ void RunAsync(Object& request) noexcept {
                         if (curl_easy_pause(transfer.easy, CURLPAUSE_CONT) != CURLE_OK) transfer.error = ERROR_NETWORK;
                     }
                     if (!transfer.error) Pump(request);
+                    if (!transfer.sent) deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(request.settings.receiveTimeout);
                     if (!transfer.done && std::chrono::steady_clock::now() >= deadline) transfer.error = ERROR_NETWORK;
                 }
                 if (transfer.ready && !headers) {
@@ -380,11 +673,12 @@ void RunAsync(Object& request) noexcept {
 
 int Drive(Object& request, bool headers) {
     auto& transfer = *request.transfer;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(request.settings.receiveTimeout);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(request.settings.receiveTimeout);
     for (;;) {
         if (const int error = Pump(request)) return error;
         if ((headers && transfer.ready) || (!headers && transfer.consumed < transfer.body.size()) || transfer.done) return 0;
         const auto now = std::chrono::steady_clock::now();
+        if (!transfer.sent) deadline = now + std::chrono::microseconds(request.settings.receiveTimeout);
         if (now >= deadline) return transfer.error = ERROR_NETWORK;
         const auto wait = std::chrono::ceil<std::chrono::milliseconds>(deadline - now).count();
         if (curl_multi_poll(transfer.multi, nullptr, 0, static_cast<int>(std::min<std::int64_t>(wait, 10)), nullptr) != CURLM_OK)
@@ -393,11 +687,13 @@ int Drive(Object& request, bool headers) {
 }
 
 int Delete(int id, Kind kind) {
+    if (InCallback(id)) return ERROR_HTTP_BUSY;
     std::shared_ptr<Object> object;
     {
         std::lock_guard lock(registryMutex);
         const auto found = registry.find(id);
         if (found == registry.end() || found->second->kind != kind) return ERROR_INVALID_ID;
+        if (found->second->callbacks) return ERROR_HTTP_BUSY;
         for (const auto& [childId, child] : registry)
             if (child->parent == id) return ERROR_HTTP_BUSY;
         object = std::move(found->second);
@@ -423,17 +719,32 @@ int Configure(int id, TFunction function) {
 
 }
 
-void HttpContextStarted_nid_no_patch(int id) {
+extern "C" int HttpSetPeerHostname_nid_no_patch(mbedtls_ssl_context* context, const char* hostname) {
+    if (!activeRequest || (activeRequest->settings.verify & 0x80)) return __real_mbedtls_ssl_set_hostname(context, hostname);
+    try {
+        activeRequest->transfer->peerHostname = hostname ? hostname : "";
+    } catch (const std::bad_alloc&) {
+        return MBEDTLS_ERR_SSL_ALLOC_FAILED;
+    }
+    return __real_mbedtls_ssl_set_hostname(context, nullptr);
+}
+
+void HttpContextStarted_nid_no_patch(int id, int sslContext) {
     if (!InitializeCurl()) throw std::runtime_error("HTTP backend initialization failed");
     auto object = std::make_shared<Object>(Kind::Context);
     object->cookieStore = std::make_shared<CookieStore>();
     object->context = id;
+    object->sslContext = sslContext;
     object->id = id;
     std::lock_guard lock(registryMutex);
     registry.emplace(id, std::move(object));
 }
 
 bool HttpHasObject_nid_no_patch(int id) { return FindAny(id) != nullptr; }
+bool HttpInCallbackContext_nid_no_patch(int id) {
+    const auto context = Find(id, Kind::Context);
+    return context && context->callbacks.load() != 0;
+}
 
 int HttpBindEpoll_nid_no_patch(int id, std::shared_ptr<HttpEventSink> sink, HttpEpollHandle handle, void* argument) {
     auto object = FindAny(id);
@@ -458,13 +769,6 @@ int HttpGetEpoll_nid_no_patch(int id, HttpEpollHandle* handle, void** argument) 
     *handle = object->settings.epollHandle;
     if (argument) *argument = object->settings.epollArgument;
     return 0;
-}
-
-bool HttpHasCertificates_nid_no_patch(int id) {
-    auto context = Find(id, Kind::Context);
-    if (!context) return false;
-    std::lock_guard lock(context->mutex);
-    return !context->settings.authorities.empty();
 }
 
 void HttpContextStopped_nid_no_patch(int id) {
@@ -492,12 +796,13 @@ int APS5_VABI sceHttpCreateTemplate(int context, const char* agent, int version,
     auto parent = Find(context, Kind::Context);
     if (!parent) return ERROR_INVALID_ID;
     if ((version != 1 && version != 2) || !agent || !Field(agent)) return ERROR_INVALID_VALUE;
-    if (proxy) NotImplemented_nid_no_patch(__func__);
+    if (proxy != 0 && proxy != 1) return ERROR_INVALID_VALUE;
     auto object = std::make_shared<Object>(Kind::Template);
     std::lock_guard lock(parent->mutex);
     object->settings = parent->settings;
     object->settings.agent = agent;
     object->settings.version = version == 1 ? CURL_HTTP_VERSION_1_0 : CURL_HTTP_VERSION_1_1;
+    object->settings.autoProxy = proxy != 0;
     object->parent = context;
     object->context = context;
     return Insert(std::move(object));
@@ -545,8 +850,6 @@ int APS5_VABI sceHttpDeleteRequest(int id) { return Delete(id, Kind::Request); }
 
 int APS5_VABI sceHttpAddRequestHeader(int id, const char* name, const char* value, std::uint32_t mode) {
     if (!name || !value || !Token(name) || !Field(value) || mode > 1) return ERROR_INVALID_VALUE;
-    if (EqualName(name, "Content-Length") || EqualName(name, "Transfer-Encoding"))
-        NotImplemented_nid_no_patch(__func__);
     return Configure(id, [&](Object& object) {
         auto& headers = object.settings.headers;
         if (mode == 0) std::erase_if(headers, [&](const auto& header) { return EqualName(header.first, name); });
@@ -562,6 +865,18 @@ int APS5_VABI sceHttpSetConnectTimeOut(int id, std::uint32_t usec) {
 int APS5_VABI sceHttpSetRecvTimeOut(int id, std::uint32_t usec) {
     if (!usec) return ERROR_INVALID_VALUE;
     return Configure(id, [&](Object& object) { object.settings.receiveTimeout = usec; return 0; });
+}
+int APS5_VABI sceHttpSetResolveTimeOut(int id, std::uint32_t usec) {
+    if (!usec) return ERROR_INVALID_VALUE;
+    return Configure(id, [&](Object& object) { object.settings.resolveTimeout = usec; return 0; });
+}
+int APS5_VABI sceHttpSetSendTimeOut(int id, std::uint32_t usec) {
+    if (!usec) return ERROR_INVALID_VALUE;
+    return Configure(id, [&](Object& object) { object.settings.sendTimeout = usec; return 0; });
+}
+int APS5_VABI sceHttpSetResolveRetry(int id, std::int32_t retry) {
+    if (retry < 0) return ERROR_INVALID_VALUE;
+    return Configure(id, [&](Object& object) { object.settings.resolveRetry = retry; return 0; });
 }
 int APS5_VABI sceHttpSetResponseHeaderMaxSize(int id, std::uint64_t size) {
     if (!size || size > SIZE_MAX) return ERROR_INVALID_VALUE;
@@ -635,13 +950,23 @@ int APS5_VABI sceHttpsEnableOption(int id, std::uint32_t flags) {
 }
 
 int APS5_VABI sceHttpsDisableOption(int id, std::uint32_t flags) {
-    if (flags & ~0x7dU) NotImplemented_nid_no_patch(__func__);
+    if (flags & ~0xfdU) NotImplemented_nid_no_patch(__func__);
     return Configure(id, [&](Object& object) { object.settings.verify &= ~flags; return 0; });
 }
 
 int APS5_VABI sceHttpsSetMinSslVersion(int id, std::uint32_t version) {
     if (version != 0 && version != 5) NotImplemented_nid_no_patch(__func__);
     return Configure(id, [&](Object& object) { object.settings.tlsVersion = CURL_SSLVERSION_TLSv1_2; return 0; });
+}
+
+int APS5_VABI sceHttpsSetSslCallback(int id, HttpsCallback callback, void* argument) {
+    return Configure(id, [&](Object& object) {
+        const int context = object.kind == Kind::Context ? object.sslContext : object.root->sslContext;
+        if (callback && !SslContextExists_nid_no_patch(context)) return ERROR_INVALID_ID;
+        object.settings.sslCallback = callback;
+        object.settings.sslArgument = argument;
+        return 0;
+    });
 }
 
 int APS5_VABI sceHttpsSetSslVersion(int id, int version) {
@@ -700,10 +1025,12 @@ int APS5_VABI sceHttpsLoadCert(int id, int count, SceSsl::Data** authorities, Sc
         if (result) return ERROR_INVALID_VALUE;
     }
     std::lock_guard lock(context->mutex);
-    if (!context->settings.key.empty()) mbedtls_platform_zeroize(context->settings.key.data(), context->settings.key.size());
-    context->settings.authorities = std::move(pem);
-    context->settings.certificate = std::move(certBytes);
-    context->settings.key = std::move(keyBytes);
+    context->settings.authorities += pem;
+    if (certificate) {
+        if (!context->settings.key.empty()) mbedtls_platform_zeroize(context->settings.key.data(), context->settings.key.size());
+        context->settings.certificate = std::move(certBytes);
+        context->settings.key = std::move(keyBytes);
+    }
     return 0;
 }
 
@@ -718,25 +1045,124 @@ int APS5_VABI sceHttpsUnloadCert(int id) {
     });
 }
 
+int APS5_VABI sceHttpsGetCaList(int id, SceSsl::CaList* output) {
+    if (!output) return ERROR_INVALID_VALUE;
+    auto context = Find(id, Kind::Context);
+    if (!context) return ERROR_INVALID_ID;
+    std::lock_guard lock(context->mutex);
+    if (context->settings.authorities.empty()) {
+        *output = {};
+        return 0;
+    }
+    SceSsl::Data input{reinterpret_cast<std::uint8_t*>(context->settings.authorities.data()), context->settings.authorities.size() + 1};
+    SceSsl::CaList list{};
+    try {
+        if (SslImportCaList_nid_no_patch(context->sslContext, &input, &list) != 0) return ERROR_INVALID_VALUE;
+        context->caLists.emplace(list.certs, list);
+    } catch (const std::bad_alloc&) {
+        if (list.certs) SslReleaseCaList_nid_no_patch(context->sslContext, list);
+        return ERROR_OUT_OF_MEMORY;
+    } catch (const std::invalid_argument&) {
+        return ERROR_INVALID_ID;
+    }
+    *output = list;
+    return 0;
+}
+
+int APS5_VABI sceHttpsFreeCaList(int id, SceSsl::CaList* list) {
+    if (!list) return ERROR_INVALID_VALUE;
+    auto context = Find(id, Kind::Context);
+    if (!context) return ERROR_INVALID_ID;
+    std::lock_guard lock(context->mutex);
+    if (!list->certs && !list->num) return 0;
+    const auto found = context->caLists.find(list->certs);
+    if (found == context->caLists.end() || found->second.num != list->num) return ERROR_INVALID_VALUE;
+    SslReleaseCaList_nid_no_patch(context->sslContext, *list);
+    context->caLists.erase(found);
+    *list = {};
+    return 0;
+}
+
 int APS5_VABI sceHttpsGetSslError(int id, int* error, std::uint32_t* detail) {
     if (!error || !detail) return ERROR_INVALID_VALUE;
     auto request = Find(id, Kind::Request);
     if (!request) return ERROR_INVALID_ID;
     std::lock_guard lock(request->mutex);
-    if (request->transfer && (request->transfer->nativeError || request->transfer->verifyError))
-        NotImplemented_nid_no_patch(__func__);
     *error = 0;
     *detail = 0;
+    if (!request->transfer) return 0;
+    const auto& transfer = *request->transfer;
+    if (transfer.callbackError) {
+        *error = static_cast<int>(0x80435063);
+        *detail = 1;
+        return 0;
+    }
+    *detail = VerificationBits(transfer.verifyError);
+    if (*detail) *error = static_cast<int>(0x80435060);
+    switch (transfer.nativeError) {
+    case CURLE_PEER_FAILED_VERIFICATION:
+    case CURLE_SSL_CERTPROBLEM:
+    case CURLE_SSL_CACERT_BADFILE:
+    case CURLE_SSL_CRL_BADFILE:
+    case CURLE_SSL_ISSUER_ERROR:
+    case CURLE_SSL_PINNEDPUBKEYNOTMATCH:
+    case CURLE_SSL_INVALIDCERTSTATUS:
+    case CURLE_SSL_CLIENTCERT:
+        *error = static_cast<int>(0x80435060);
+        if (!*detail) *detail = 2;
+        break;
+    case CURLE_SSL_CONNECT_ERROR:
+    case CURLE_SSL_CIPHER:
+    case CURLE_USE_SSL_FAILED:
+        if (!*error) *error = static_cast<int>(0x80435061);
+        if (!*detail) *detail = 1;
+        break;
+    case CURLE_SSL_ENGINE_NOTFOUND:
+    case CURLE_SSL_ENGINE_SETFAILED:
+    case CURLE_SSL_ENGINE_INITFAILED:
+        *error = static_cast<int>(0x80435063);
+        *detail |= 1;
+        break;
+    case CURLE_SEND_ERROR:
+    case CURLE_RECV_ERROR:
+    case CURLE_SSL_SHUTDOWN_FAILED: {
+        curl_off_t connected = 0;
+        curl_easy_getinfo(transfer.easy, CURLINFO_APPCONNECT_TIME_T, &connected);
+        if (connected && (request->url.starts_with("https:") || request->proxy.starts_with("https:"))) {
+            *error = static_cast<int>(0x80435062);
+            *detail |= 1;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    long proxyStatus = 0;
+    curl_easy_getinfo(transfer.easy, CURLINFO_HTTP_CONNECTCODE, &proxyStatus);
+    if (proxyStatus >= 300 && (request->url.starts_with("https:") || request->proxy.starts_with("https:"))) {
+        *error = static_cast<int>(0x80435064);
+        *detail = 0;
+    }
     return 0;
 }
 
 int APS5_VABI sceHttpSendRequest(int id, const void* data, std::size_t size) {
+    if (InCallback(id)) return ERROR_HTTP_BUSY;
     auto request = Find(id, Kind::Request);
     if (!request) return ERROR_INVALID_ID;
     std::lock_guard lock(request->mutex);
     if (request->aborted) return ERROR_ABORTED;
     if (request->transfer) return ERROR_INVALID_VALUE;
-    if ((!data && size) || (!request->settings.chunked && size != request->contentLength) || size > INT64_MAX) return ERROR_INVALID_VALUE;
+    if ((!data && size) || size > INT64_MAX) return ERROR_INVALID_VALUE;
+    bool chunked = request->settings.chunked;
+    bool length = false;
+    std::string encoding;
+    if (const int error = Framing(*request, size, chunked, length, encoding)) return error;
+    if (!request->proxy.empty() && (size || chunked)) return ERROR_INVALID_VALUE;
+    std::string proxy = request->proxy;
+    if (proxy.empty() && request->settings.autoProxy) {
+        if (const int error = ProxyConfiguration(proxy)) return error;
+    }
     {
         std::lock_guard contextLock(request->root->mutex);
         request->settings.authorities = request->root->settings.authorities;
@@ -763,12 +1189,16 @@ int APS5_VABI sceHttpSendRequest(int id, const void* data, std::size_t size) {
     set(CURLOPT_SSL_VERIFYPEER, (request->settings.verify & 1) ? 1L : 0L);
     set(CURLOPT_SSL_VERIFYHOST, (request->settings.verify & 4) ? 2L : 0L);
     set(CURLOPT_SSLVERSION, request->settings.tlsVersion);
+    set(CURLOPT_PROXY_SSL_VERIFYPEER, (request->settings.verify & 1) ? 1L : 0L);
+    set(CURLOPT_PROXY_SSL_VERIFYHOST, (request->settings.verify & 4) ? 2L : 0L);
+    set(CURLOPT_PROXY_SSLVERSION, request->settings.tlsVersion);
     set(CURLOPT_SSL_SESSIONID_CACHE, (request->settings.verify & 0x40) ? 1L : 0L);
     set(CURLOPT_SSL_CTX_FUNCTION, ConfigureTls);
     set(CURLOPT_SSL_CTX_DATA, request.get());
     if (!request->settings.authorities.empty()) {
         curl_blob blob{request->settings.authorities.data(), request->settings.authorities.size() + 1, CURL_BLOB_COPY};
         set(CURLOPT_CAINFO_BLOB, &blob);
+        set(CURLOPT_PROXY_CAINFO_BLOB, &blob);
     }
     if (!request->settings.certificate.empty()) {
         curl_blob cert{request->settings.certificate.data(), request->settings.certificate.size(), CURL_BLOB_COPY};
@@ -777,15 +1207,24 @@ int APS5_VABI sceHttpSendRequest(int id, const void* data, std::size_t size) {
         set(CURLOPT_SSLKEYTYPE, request->settings.key.front() == 0x30 ? "DER" : "PEM");
         set(CURLOPT_SSLCERT_BLOB, &cert);
         set(CURLOPT_SSLKEY_BLOB, &key);
+        set(CURLOPT_PROXY_SSLCERTTYPE, request->settings.certificate.front() == 0x30 ? "DER" : "PEM");
+        set(CURLOPT_PROXY_SSLKEYTYPE, request->settings.key.front() == 0x30 ? "DER" : "PEM");
+        set(CURLOPT_PROXY_SSLCERT_BLOB, &cert);
+        set(CURLOPT_PROXY_SSLKEY_BLOB, &key);
     }
     if (request->settings.cookies) {
         set(CURLOPT_SHARE, request->cookieStore->share);
         set(CURLOPT_COOKIEFILE, "");
     }
     if (request->settings.inflate) set(CURLOPT_ACCEPT_ENCODING, "gzip,deflate");
-    set(CURLOPT_PROXY, "");
+    set(CURLOPT_PROXY, proxy.c_str());
+    set(CURLOPT_NOPROXY, "");
+    if (!request->proxy.empty()) {
+        set(CURLOPT_HTTPPROXYTUNNEL, 1L);
+        set(CURLOPT_CONNECT_ONLY, 1L);
+    }
     set(CURLOPT_NOSIGNAL, 1L);
-    set(CURLOPT_FORBID_REUSE, request->settings.keepAlive ? 0L : 1L);
+    set(CURLOPT_FORBID_REUSE, request->settings.keepAlive || !request->proxy.empty() ? 0L : 1L);
     set(CURLOPT_HTTP_VERSION, request->settings.version);
     set(CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>((std::uint64_t{request->settings.connectTimeout} + 999) / 1000));
     set(CURLOPT_USERAGENT, request->settings.agent.c_str());
@@ -793,9 +1232,14 @@ int APS5_VABI sceHttpSendRequest(int id, const void* data, std::size_t size) {
     set(CURLOPT_HEADERDATA, &transfer);
     set(CURLOPT_WRITEFUNCTION, Body);
     set(CURLOPT_WRITEDATA, &transfer);
+    set(CURLOPT_RESOLVER_START_FUNCTION, ResolverStarted);
+    set(CURLOPT_RESOLVER_START_DATA, &transfer);
+    set(CURLOPT_DNS_CACHE_TIMEOUT, 0L);
+    set(CURLOPT_PREREQFUNCTION, SendStarted);
+    set(CURLOPT_PREREQDATA, &transfer);
     set(CURLOPT_CUSTOMREQUEST, request->method.c_str());
     if (request->method == "HEAD") set(CURLOPT_NOBODY, 1L);
-    else if (size || request->settings.chunked || request->method == "POST" || request->method == "PUT") {
+    else if (size || chunked || request->method == "POST" || request->method == "PUT") {
         set(CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(size));
         set(CURLOPT_COPYPOSTFIELDS, size ? data : "");
     }
@@ -805,10 +1249,15 @@ int APS5_VABI sceHttpSendRequest(int id, const void* data, std::size_t size) {
         transfer.outgoing = next;
     };
     append("Expect:");
-    if (request->settings.chunked) append("Transfer-Encoding: chunked");
-    if (!request->settings.keepAlive) append("Connection: close");
-    for (const auto& [name, value] : request->settings.headers) append(name + (value.empty() ? ";" : ": " + value));
+    if (chunked) append("Transfer-Encoding: " + (encoding.empty() ? std::string("chunked") : encoding));
+    if (length) append("Content-Length: " + std::to_string(size));
+    if (!request->settings.keepAlive && request->proxy.empty()) append("Connection: close");
+    for (const auto& [name, value] : request->settings.headers) {
+        if (EqualName(name, "Content-Length") || EqualName(name, "Transfer-Encoding")) continue;
+        append(name + (value.empty() ? ";" : ": " + value));
+    }
     set(CURLOPT_HTTPHEADER, transfer.outgoing);
+    if (!request->proxy.empty()) set(CURLOPT_PROXYHEADER, transfer.outgoing);
     if (curl_multi_add_handle(transfer.multi, transfer.easy) != CURLM_OK) return transfer.error = ERROR_NETWORK;
     transfer.attached = true;
     if (request->settings.nonblock) {
@@ -820,6 +1269,7 @@ int APS5_VABI sceHttpSendRequest(int id, const void* data, std::size_t size) {
 }
 
 int APS5_VABI sceHttpReadData(int id, void* output, std::size_t size) {
+    if (InCallback(id)) return ERROR_HTTP_BUSY;
     auto request = Find(id, Kind::Request);
     if (!request) return ERROR_INVALID_ID;
     if (!output && size) return ERROR_INVALID_VALUE;
@@ -834,7 +1284,7 @@ int APS5_VABI sceHttpReadData(int id, void* output, std::size_t size) {
         transfer.body.clear();
         transfer.consumed = 0;
         transfer.paused = false;
-        if (curl_easy_pause(transfer.easy, CURLPAUSE_CONT) != CURLE_OK) return transfer.error = ERROR_NETWORK;
+        if (!transfer.tunnel && curl_easy_pause(transfer.easy, CURLPAUSE_CONT) != CURLE_OK) return transfer.error = ERROR_NETWORK;
         if (const int error = Drive(*request, false)) return error;
     }
     const auto count = std::min({size, transfer.body.size() - transfer.consumed, request->settings.readBlock, std::size_t{INT_MAX}});
@@ -885,7 +1335,8 @@ int APS5_VABI sceHttpGetResponseContentLength(int id, int* result, std::uint64_t
     if (request->transfer && request->transfer->error) return request->transfer->error;
     if (!request->transfer || !request->transfer->ready) return request->transfer && request->settings.nonblock ? ERROR_AGAIN : ERROR_NETWORK;
     curl_off_t length = -1;
-    if (curl_easy_getinfo(request->transfer->easy, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &length) != CURLE_OK) return ERROR_NETWORK;
+    if (!request->transfer->tunnel && curl_easy_getinfo(request->transfer->easy, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &length) != CURLE_OK)
+        return ERROR_NETWORK;
     *result = length < 0 ? static_cast<int>(0x80431071) : 0;
     *size = length < 0 ? 0 : static_cast<std::uint64_t>(length);
     return 0;
