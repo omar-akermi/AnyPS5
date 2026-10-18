@@ -437,6 +437,10 @@ static void MinimumVersion(int context, int connection) {
     Require(sceHttpsLoadCert(context, 1, &pointer, nullptr, nullptr) == 0);
     Require(sceHttpsSetMinSslVersion(connection, 6) == InvalidValue);
     Require(sceHttpsSetMinSslVersion(connection, UINT32_MAX) == InvalidValue);
+    Require(sceHttpsSetSslVersion(connection, -1) == InvalidValue);
+    Require(sceHttpsSetSslVersion(connection, 6) == InvalidValue);
+    Require(sceHttpsSetSslVersion(connection, INT32_MAX) == InvalidValue);
+    Require(sceHttpsSetSslVersion(-1, 5) == InvalidId);
     for (std::uint32_t version = 0; version <= 5; ++version) {
         const int request = Request(connection, "/binary");
         Require(sceHttpsSetMinSslVersion(request, version) == 0);
@@ -444,6 +448,19 @@ static void MinimumVersion(int context, int connection) {
         Require(Read(request).size() == 1024);
         Require(sceHttpDeleteRequest(request) == 0);
     }
+    for (int version = 0; version <= 5; ++version) {
+        Require(sceHttpsSetSslVersion(connection, version) == 0);
+        const int request = Request(connection, "/binary");
+        Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+        Require(sceHttpsSetSslVersion(request, 0) == InvalidValue);
+        Require(Read(request).size() == 1024);
+        Require(sceHttpDeleteRequest(request) == 0);
+    }
+    const int request = Request(connection, "/binary");
+    Require(sceHttpsSetSslVersion(request, 5) == 0);
+    Require(sceHttpsSetMinSslVersion(request, 0) == 0);
+    Require(sceHttpSendRequest(request, nullptr, 0) == 0 && Read(request).size() == 1024);
+    Require(sceHttpDeleteRequest(request) == 0);
 }
 
 static void Sni(int context, int connection, const char* url) {
