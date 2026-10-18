@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -121,7 +122,7 @@ public:
             VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
             allocation.allocationSize = requirements.size;
             allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &created.memory), "vkAllocateMemory multisampled target");
+            created.memory = AllocateImageMemory(context, allocation, requirements.memoryTypeBits, "vkAllocateMemory multisampled target");
             Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, created.image, created.memory, 0), "vkBindImageMemory multisampled target");
             VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             viewInfo.image = created.image;
@@ -227,7 +228,7 @@ public:
         return (usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
     }
 
-    std::shared_ptr<Texture> Sampled(VkComponentMapping components) {
+    std::shared_ptr<Texture> Sampled(VkComponentMapping components, VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D) {
         Require(sampleable, "the device cannot sample the multisampled color target's format at its sample count");
         Require(cmask.Refusal().empty(), cmask.Refusal());
         Require(cmask.Keys() != DccKeys::Clear0000, "sampling a multisampled color target whose CMASK fast clear no draw has applied is not implemented");
@@ -238,9 +239,9 @@ public:
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
             Recorder::CountBarriers(Recorder::CommandClass::Draw, 1);
         });
-        const std::array<std::uint32_t, 4> key{static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a)};
+        const std::array<std::uint32_t, 5> key{static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a), static_cast<std::uint32_t>(viewType)};
         if (const auto found = textures.find(key); found != textures.end()) return found->second;
-        auto texture = std::make_shared<Texture>(context, image, target.format, VK_IMAGE_ASPECT_COLOR_BIT, components);
+        auto texture = std::make_shared<Texture>(context, image, target.format, VK_IMAGE_ASPECT_COLOR_BIT, components, viewType);
         textures.emplace(key, texture);
         return texture;
     }
@@ -298,7 +299,7 @@ private:
     std::vector<Allocation> retired;
     VkImageView storageView = VK_NULL_HANDLE;
     bool storageWritten = false;
-    std::map<std::array<std::uint32_t, 4>, std::shared_ptr<Texture>> textures;
+    std::map<std::array<std::uint32_t, 5>, std::shared_ptr<Texture>> textures;
     std::vector<GuestMemory::UnchangedQuery> dccRanges;
 
     VkClearColorValue initialDccClear(const ColorTarget& use) {
@@ -676,7 +677,26 @@ VkImageView MultisampleTargetView(const Context& context, const ColorTarget& tar
     return acquire(context, target).view;
 }
 
-std::shared_ptr<Texture> MultisampleTargetTexture(const Context& context, const GuestTextureResource& resource, VkComponentMapping components) {
+namespace {
+
+bool redBlueSwapped(VkFormat rendered, VkFormat sampled) {
+    const auto pair = [&](VkFormat a, VkFormat b) { return (rendered == a && sampled == b) || (rendered == b && sampled == a); };
+    return pair(VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM) || pair(VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_SRGB) || pair(VK_FORMAT_B8G8R8A8_SNORM, VK_FORMAT_R8G8B8A8_SNORM) || pair(VK_FORMAT_B8G8R8A8_UINT, VK_FORMAT_R8G8B8A8_UINT) || pair(VK_FORMAT_B8G8R8A8_SINT, VK_FORMAT_R8G8B8A8_SINT);
+}
+
+VkComponentMapping swapRedBlue(VkComponentMapping components) {
+    const auto swapped = [](VkComponentSwizzle swizzle, VkComponentSwizzle identity) {
+        if (swizzle == VK_COMPONENT_SWIZZLE_IDENTITY) swizzle = identity;
+        if (swizzle == VK_COMPONENT_SWIZZLE_R) return VK_COMPONENT_SWIZZLE_B;
+        if (swizzle == VK_COMPONENT_SWIZZLE_B) return VK_COMPONENT_SWIZZLE_R;
+        return swizzle;
+    };
+    return {swapped(components.r, VK_COMPONENT_SWIZZLE_R), swapped(components.g, VK_COMPONENT_SWIZZLE_G), swapped(components.b, VK_COMPONENT_SWIZZLE_B), swapped(components.a, VK_COMPONENT_SWIZZLE_A)};
+}
+
+}
+
+std::shared_ptr<Texture> MultisampleTargetTexture(const Context& context, const GuestTextureResource& resource, VkComponentMapping components, VkImageViewType viewType) {
     std::lock_guard lock(targetsMutex());
     const auto format = ResolveTextureFormat(resource.format);
     const MultisampleTarget* other = nullptr;
@@ -684,12 +704,14 @@ std::shared_ptr<Texture> MultisampleTargetTexture(const Context& context, const 
         if (!target->active->load(std::memory_order_acquire)) continue;
         if (target->context.device != context.device || target->target.surfaceAddress != resource.baseAddress) continue;
         const auto& rendered = target->target;
-        if (rendered.format == format && rendered.extent.width == resource.width && rendered.extent.height == resource.height && rendered.samples == resource.samples && rendered.mip == 0) return target->Sampled(components);
+        const bool sameShape = rendered.extent.width == resource.width && rendered.extent.height == resource.height && rendered.samples == resource.samples && rendered.mip == 0;
+        if (sameShape && rendered.format == format) return target->Sampled(components, viewType);
+        if (sameShape && redBlueSwapped(rendered.format, format)) return target->Sampled(swapRedBlue(components), viewType);
         other = target.get();
     }
     if (other == nullptr) {
         Require(Recorder::Active() != nullptr, "a multisampled texture is only sampled by recorded draws and dispatches");
-        return createFilled(context, resource, format, "sampling").Sampled(components);
+        return createFilled(context, resource, format, "sampling").Sampled(components, viewType);
     }
     char text[320];
     std::snprintf(text, sizeof(text), "AGC graphics: sampling multisampled color target 0x%llx (%ux%u, %u samples, vk format %d) as a %ux%u texture of %u samples and guest format %u (vk %d) is not implemented", static_cast<unsigned long long>(resource.baseAddress), other->target.extent.width, other->target.extent.height, other->target.samples, static_cast<int>(other->target.format), resource.width, resource.height, resource.samples, resource.format, static_cast<int>(format));

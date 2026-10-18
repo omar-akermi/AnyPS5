@@ -141,7 +141,7 @@ const char* KindName(Kind kind) {
 #ifdef _WIN32
 std::optional<Kind> Classify(int fd, const char* function) {
     if (fd < 0 || !DescriptorIsOpen_nid_no_patch(fd)) return std::nullopt;
-    if (File::DirectoryDescriptorPath(fd)) return Kind::Directory;
+    if (File::IsDirectoryDescriptor(fd)) return Kind::Directory;
     if (File::IsRandomDevice(fd)) return Kind::RandomDevice;
     if (File::IsArchivedFile(fd)) return Kind::ArchivedFile;
     switch (::GetFileType(WindowsDescriptorHandle_nid_no_patch(fd))) {
@@ -568,6 +568,18 @@ bool Appends(int fd) {
     std::lock_guard lock(g_mutex);
     const auto found = g_entries.find(fd);
     return found != g_entries.end() && found->second.status && (*found->second.status & Append) != 0;
+}
+
+bool IsVnode(int fd) {
+    if (fd < 0 || File::IsRandomDevice(fd)) return false;
+    if (File::IsArchivedFile(fd)) return true;
+#ifdef _WIN32
+    if (!DescriptorIsOpen_nid_no_patch(fd)) return false;
+    return File::DirectoryDescriptorPath(fd) || ::GetFileType(WindowsDescriptorHandle_nid_no_patch(fd)) == FILE_TYPE_DISK;
+#else
+    struct stat status{};
+    return ::fstat(fd, &status) == 0 && (S_ISREG(status.st_mode) || S_ISDIR(status.st_mode));
+#endif
 }
 
 }

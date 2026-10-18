@@ -61,7 +61,7 @@ class CheckCompileTests(unittest.TestCase):
         environment = dict(os.environ)
         environment.update(env or {})
         return subprocess.run([sys.executable, "-I", str(TOOL), *arguments], cwd=self.root,
-                              capture_output=True, text=True, env=environment)
+                              capture_output=True, text=True, encoding="utf-8", env=environment)
 
     def source(self, relative, text="int x;\n"):
         path = self.root / relative
@@ -288,6 +288,28 @@ class CheckCompileTests(unittest.TestCase):
         result = self.tool("--base", "HEAD")
         self.assertEqual(result.returncode, 1)
         self.assertIn("changed.cpp:1:1: error: no", result.stderr)
+
+    def test_files_changed_only_on_the_base_since_the_branch_point_are_not_checked(self):
+        script = self.compiler("import sys\nsys.stderr.write(sys.argv[-1] + ': error: no\\n')\nsys.exit(1)\n")
+        self.manifest([self.entry(name, f'"{sys.executable}" "{script}" "{self.root / name}"')
+                       for name in ("mine.cpp", "other.cpp")])
+        git = ["git", "-C", str(self.root)]
+        self.source("other.cpp")
+        subprocess.run([*git, "add", "other.cpp"], check=True)
+        subprocess.run([*git, "commit", "-qm", "add"], check=True)
+        subprocess.run([*git, "branch", "-M", "main"], check=True)
+        subprocess.run([*git, "checkout", "-qb", "side"], check=True)
+        self.source("mine.cpp")
+        subprocess.run([*git, "add", "mine.cpp"], check=True)
+        subprocess.run([*git, "commit", "-qm", "mine"], check=True)
+        subprocess.run([*git, "checkout", "-q", "main"], check=True)
+        self.source("other.cpp", "int y;\n")
+        subprocess.run([*git, "commit", "-qam", "other"], check=True)
+        subprocess.run([*git, "checkout", "-q", "side"], check=True)
+        result = self.tool("--base", "main")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("mine.cpp: error: no", result.stderr)
+        self.assertNotIn("other.cpp", result.stderr)
 
     def test_no_changed_translation_unit_is_not_a_failure(self):
         self.source("clean.cpp")

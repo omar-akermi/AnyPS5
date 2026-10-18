@@ -397,8 +397,8 @@ static void Tls(int context, int connection, const char* url, bool mutual) {
         request = Request(connection, "/binary");
         Require(sceHttpSendRequest(request, nullptr, 0) == 0 && Read(request).size() == 1024);
         Require(sceHttpDeleteRequest(request) == 0);
-        SceSsl::Data cert{const_cast<std::uint8_t*>(ClientDer.data()), ClientDer.size()};
-        SceSsl::Data key{const_cast<std::uint8_t*>(ClientKeyDer.data()), ClientKeyDer.size()};
+        SceSsl::Data cert{const_cast<std::uint8_t*>(HttpTlsFixture::ClientDer.data()), HttpTlsFixture::ClientDer.size()};
+        SceSsl::Data key{const_cast<std::uint8_t*>(HttpTlsFixture::ClientKeyDer.data()), HttpTlsFixture::ClientKeyDer.size()};
         Require(sceHttpsLoadCert(context, 1, &pointer, &cert, &key) == 0);
         request = Request(connection, "/binary");
         Require(sceHttpSendRequest(request, nullptr, 0) == 0);

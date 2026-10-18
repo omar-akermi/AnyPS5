@@ -60,7 +60,10 @@ def index(build, root):
 
 
 def changed(root, base):
-    result = capture(["git", "-C", str(root), "diff", "--name-only", "--diff-filter=ACMR", "-z", base])
+    fork = capture(["git", "-C", str(root), "merge-base", base, "HEAD"])
+    if fork.returncode != 0:
+        raise ValueError(f"git merge-base {base}: {fork.stderr.strip()}")
+    result = capture(["git", "-C", str(root), "diff", "--name-only", "--diff-filter=ACMR", "-z", fork.stdout.strip()])
     if result.returncode != 0:
         raise ValueError(f"git diff {base}: {result.stderr.strip()}")
     untracked = capture(["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"])
@@ -152,6 +155,9 @@ def check(root, build, files):
 
 
 def main(argv=None):
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
         description="compile the changed translation units only, to check a change builds without a full build")
     parser.add_argument("--build", type=Path, default=Path("build"),

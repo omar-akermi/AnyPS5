@@ -97,6 +97,17 @@ if(BUILD_TESTING)
     add_test(NAME request_serializer COMMAND request_serializer_tests)
     set_tests_properties(request_serializer PROPERTIES TIMEOUT 20)
     find_package(Python3 QUIET COMPONENTS Interpreter)
+    add_test_executable(shader_ir_use_rewrite_tests
+        core/shader/recompiler/IntermediateRepresentation/tests/UseRewrite.cpp
+        core/shader/recompiler/IntermediateRepresentation/tests/UseRewriteAllocation.cpp
+        core/shader/recompiler/IntermediateRepresentation/src/IrValue.cpp
+        core/shader/recompiler/IntermediateRepresentation/src/IrBlock.cpp
+        core/shader/recompiler/IntermediateRepresentation/src/IrOpcode.cpp
+        core/shader/recompiler/IntermediateRepresentation/src/GuestRegister.cpp)
+    target_include_directories(shader_ir_use_rewrite_tests PRIVATE
+        core/shader/recompiler/IntermediateRepresentation/include)
+    add_test(NAME shader_ir_use_rewrite COMMAND shader_ir_use_rewrite_tests)
+    set_tests_properties(shader_ir_use_rewrite PROPERTIES TIMEOUT 20)
     if(Python3_Interpreter_FOUND)
         add_test(NAME shader_cache_native_paths COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/core/shader/recompiler/tests/test_shader_cache_native_paths.py
@@ -108,6 +119,8 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pr_overlap_dependencies.py)
         add_test(NAME pr_overlap_tools COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pr_overlap.py)
+        add_test(NAME pr_labels COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pr_labels.py)
         add_test(NAME progress_history COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_progress_history.py)
         add_test(NAME progress_report COMMAND ${Python3_EXECUTABLE}
@@ -124,14 +137,14 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_import_audit.py)
         add_test(NAME unwrap_self COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_unwrap_self.py)
-        foreach(shard RANGE 0 5)
+        foreach(shard RANGE 0 11)
             if(shard EQUAL 0)
                 set(conventions_test_name conventions_function_bodies)
             else()
                 set(conventions_test_name conventions_function_bodies_shard_${shard})
             endif()
             add_test(NAME ${conventions_test_name} COMMAND ${Python3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_comments.py --shard ${shard}/6)
+                ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_comments.py --shard ${shard}/12)
             set_tests_properties(${conventions_test_name} PROPERTIES TIMEOUT 30)
         endforeach()
         add_test(NAME conventions_wrapped_declarations COMMAND ${Python3_EXECUTABLE}
@@ -140,6 +153,8 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_ci_gate.py)
         add_test(NAME conventions_doc_links COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_doc_links.py)
+        add_test(NAME conventions_unknown_nids COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_unknown_nids.py)
         add_test(NAME test_registration COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_test_registration.py)
         add_test(NAME build_eligibility COMMAND ${Python3_EXECUTABLE}
@@ -184,6 +199,12 @@ if(BUILD_TESTING)
         add_test(NAME conventions_bom_shebang COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_bom_shebang.py)
         set_tests_properties(conventions_bom_shebang PROPERTIES TIMEOUT 20)
+        add_test(NAME env_reference COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_env_reference.py)
+        set_tests_properties(env_reference PROPERTIES TIMEOUT 20)
+        add_test(NAME conventions_env_reference COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_env_reference.py)
+        set_tests_properties(conventions_env_reference PROPERTIES TIMEOUT 60)
         add_test(NAME conventions_body_bom COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_body_bom.py)
         add_test(NAME conventions_blob_reads COMMAND ${Python3_EXECUTABLE}

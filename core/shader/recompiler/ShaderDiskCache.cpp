@@ -87,7 +87,7 @@ namespace ShaderRecompiler::ShaderDiskCache {
 static_assert(sizeof(CompiledShaderArtifact) == 240, "CompiledShaderArtifact changed: update the artifact encoder");
 static_assert(sizeof(ShaderInvocation) == 200, "ShaderInvocation changed: update the invocation encoder");
 static_assert(sizeof(RecompileResult) == 472, "RecompileResult changed: update EncodeResult and DecodeResult");
-static_assert(sizeof(DescriptorBinding) == 592, "DescriptorBinding changed: update the binding encoder");
+static_assert(sizeof(DescriptorBinding) == 632, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 16, "FragmentParameter changed: update the parameter encoder");
@@ -104,12 +104,12 @@ static_assert(sizeof(IrDescriptorBinding) == 32, "IrDescriptorBinding changed: u
 static_assert(sizeof(BindingAllocationResult) == 184, "BindingAllocationResult changed: update the allocation encoder");
 static_assert(sizeof(CompiledBindingLayout) == 88, "CompiledBindingLayout changed: update the allocation encoder");
 static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildKey");
-static_assert(sizeof(IrResourcePlan) == 712, "IrResourcePlan changed: update EncodePlan and DecodePlan");
+static_assert(sizeof(IrResourcePlan) == 728, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(sizeof(IrValue) == 152, "IrValue changed: update the plan value encoder");
 static_assert(sizeof(GuestRegister) == 8, "GuestRegister changed: update the plan value encoder");
 static_assert(sizeof(MemoryInfo) == 80, "MemoryInfo changed: update the plan encoder");
-static_assert(sizeof(DescriptorSource) == 160, "DescriptorSource changed: update the plan encoder");
-static_assert(sizeof(TableColumn) == 80, "TableColumn changed: update the plan encoder");
+static_assert(sizeof(DescriptorSource) == 192, "DescriptorSource changed: update the plan encoder");
+static_assert(sizeof(TableColumn) == 112, "TableColumn changed: update the plan encoder");
 static_assert(sizeof(KeyDomain) == 16, "KeyDomain changed: update the plan encoder");
 static_assert(sizeof(ResourceBlock) == 80, "ResourceBlock changed: update the plan encoder");
 static_assert(sizeof(SrtRead) == 16, "SrtRead changed: update the plan encoder");
@@ -145,11 +145,11 @@ static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: upda
 static_assert(fieldCount<SampledResourcePair>() == 3, "SampledResourcePair changed: update the info encoder");
 static_assert(fieldCount<StageInput>() == 5, "StageInput changed: update the info encoder");
 static_assert(fieldCount<StageOutput>() == 4, "StageOutput changed: update the info encoder");
-static_assert(fieldCount<IrResourcePlan>() == 23, "IrResourcePlan changed: update EncodePlan and DecodePlan");
+static_assert(fieldCount<IrResourcePlan>() == 24, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update the plan value encoder");
 static_assert(fieldCount<MemoryInfo>() == 31, "MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 3, "DescriptorSource changed: update the plan encoder");
-static_assert(fieldCount<TableColumn>() == 15, "TableColumn changed: update the plan encoder");
+static_assert(fieldCount<TableColumn>() == 18, "TableColumn changed: update the plan encoder");
 static_assert(fieldCount<KeyDomain>() == 4, "KeyDomain changed: update the plan encoder");
 static_assert(fieldCount<ResourceBlock>() == 4, "ResourceBlock changed: update the plan encoder");
 static_assert(fieldCount<SrtRead>() == 2, "SrtRead changed: update the plan encoder");
@@ -427,6 +427,7 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Flags(binding.imageUnnormalized);
     writer.Flags(binding.imageUnnormalizedBaseLevel);
     writer.Flags(binding.samplerIntegerBorder);
+    writer.Flags(binding.samplerCoordinatesIgnored);
     writer.Values(std::span<const std::uint32_t>(binding.imageSamplers));
     writer.Flags(binding.bufferRead);
 }
@@ -454,6 +455,7 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     reader.Flags(binding.imageUnnormalized);
     reader.Flags(binding.imageUnnormalizedBaseLevel);
     reader.Flags(binding.samplerIntegerBorder);
+    reader.Flags(binding.samplerCoordinatesIgnored);
     reader.Values(binding.imageSamplers);
     reader.Flags(binding.bufferRead);
 }
@@ -1045,8 +1047,14 @@ bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
         out.Value(column.indirect);
         out.Value(column.indirectOffset);
         out.Value(column.indirectImmediate);
+        out.List(column.pointerHops, [](Writer& hops, const PointerHop& hop) {
+            hops.Value(hop.offset);
+            hops.Value(hop.immediate);
+        });
         out.Value(column.foldedAddend);
         out.Value(column.foldedCarry);
+        out.Value(column.selected);
+        out.Value(column.selection);
     });
     writer.List(plan.controlFlow, [&](Writer& out, const ResourceBlock& block) {
         out.Value(valueIndex(block.condition));
@@ -1200,8 +1208,14 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
         in.Value(column.indirect);
         in.Value(column.indirectOffset);
         in.Value(column.indirectImmediate);
+        in.List(column.pointerHops, 8, [](Reader& hops, PointerHop& hop) {
+            hops.Value(hop.offset);
+            hops.Value(hop.immediate);
+        });
         in.Value(column.foldedAddend);
         in.Value(column.foldedCarry);
+        in.Value(column.selected);
+        in.Value(column.selection);
         source.tableColumn = table ? std::optional(std::move(column)) : std::nullopt;
     });
     reader.List(plan.controlFlow, 28, [&](Reader& in, ResourceBlock& block) {
@@ -1234,7 +1248,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
     if (!valid || !reader.Done() || fill.words > plan.uniformFill.values.size()) return false;
     const auto knownSource = [&](std::uint32_t source) { return source < plan.descriptorSources.size(); };
     if (!std::ranges::all_of(plan.materializationSources, knownSource)) return false;
-    if (!std::ranges::all_of(plan.descriptorSources, [&](const DescriptorSource& source) { return source.dwordCount <= source.dwords.size() && (!source.tableColumn.has_value() || (knownSource(source.tableColumn->heapSource) && std::ranges::all_of(source.tableColumn->keyDomains, [&](const KeyDomain& domain) { return knownSource(domain.source); }))); })) return false;
+    if (!std::ranges::all_of(plan.descriptorSources, [&](const DescriptorSource& source) { return source.dwordCount <= source.dwords.size() && (!source.tableColumn.has_value() || (knownSource(source.tableColumn->heapSource) && (!source.tableColumn->selected || knownSource(source.tableColumn->selection)) && std::ranges::all_of(source.tableColumn->keyDomains, [&](const KeyDomain& domain) { return knownSource(domain.source); }))); })) return false;
     if (!std::ranges::all_of(plan.info.buffers, [&](const BufferResource& buffer) { return knownSource(buffer.source); })) return false;
     if (!std::ranges::all_of(plan.info.images, [&](const ImageResource& image) { return knownSource(image.source); })) return false;
     if (!std::ranges::all_of(plan.info.samplers, [&](const SamplerResource& sampler) { return knownSource(sampler.source); })) return false;

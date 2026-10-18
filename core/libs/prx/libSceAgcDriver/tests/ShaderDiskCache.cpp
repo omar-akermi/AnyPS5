@@ -84,7 +84,7 @@ void removeCacheDirectory(const std::filesystem::path& directory) {
 }
 
 bool sameBinding(const DescriptorBinding& left, const DescriptorBinding& right) {
-    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.imageShapes == right.imageShapes && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.bufferRead == right.bufferRead && left.samplerUnnormalized == right.samplerUnnormalized && left.samplerIntegerBorder == right.samplerIntegerBorder && left.imageUnnormalized == right.imageUnnormalized && left.imageUnnormalizedBaseLevel == right.imageUnnormalizedBaseLevel && left.imageSamplers == right.imageSamplers;
+    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.imageShapes == right.imageShapes && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.bufferRead == right.bufferRead && left.samplerUnnormalized == right.samplerUnnormalized && left.samplerIntegerBorder == right.samplerIntegerBorder && left.samplerCoordinatesIgnored == right.samplerCoordinatesIgnored && left.imageUnnormalized == right.imageUnnormalized && left.imageUnnormalizedBaseLevel == right.imageUnnormalizedBaseLevel && left.imageSamplers == right.imageSamplers;
 }
 
 bool sameBindings(const std::vector<DescriptorBinding>& left, const std::vector<DescriptorBinding>& right) {
@@ -176,6 +176,7 @@ DescriptorBinding sampleBinding(std::uint32_t seed) {
     binding.bufferWritten = {false, false, true, true, false};
     binding.samplerUnnormalized = {false, true, true};
     binding.samplerIntegerBorder = {true, false, seed % 2 == 1};
+    binding.samplerCoordinatesIgnored = {false, seed % 2 == 0, true};
     binding.imageUnnormalized = {true, false, seed % 2 == 0};
     binding.imageUnnormalizedBaseLevel = {false, true, seed % 3 == 0};
     binding.imageSamplers = {0x5u, 0u, 0x80000000u};
@@ -649,6 +650,7 @@ void verifyKeySensitivity() {
     changes("f64 denormal preservation", [](SampleRequest& sample) { sample.request.target.float64DenormPreserve = true; });
     changes("f16 denormal preservation", [](SampleRequest& sample) { sample.request.target.float16DenormPreserve = true; });
     changes("spanned waves", [](SampleRequest& sample) { sample.request.target.spannedWaves = true; });
+    changes("robust buffer access 2", [](SampleRequest& sample) { sample.request.target.robustBufferAccess2 = true; });
     changes("the workgroup size limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupSize[2] = 128; });
     changes("the invocation limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupInvocations = 512; });
     changes("the shared memory limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupSharedMemoryBytes = 32768; });
@@ -1196,7 +1198,8 @@ void verifyBindingPlanSelection() {
         throw std::runtime_error("binding plan accepted an unsupported buffer alignment");
     };
     snapshot.buffers[0].dwords[0] |= 2u;
-    rejectsAlignment("buffer atomic on a V# whose base is not DWORD aligned");
+    const auto atomicPlan = builder.Prepare(compiled.layout, info, IrShaderStage::Compute, snapshot);
+    require(std::ranges::any_of(atomicPlan.specialization, [](const PipelineSpecializationConstant& constant) { return constant.id == PipelineSpecialization::BufferBase + 3u && constant.value == 2u; }), "a buffer atomic V# off a DWORD boundary did not record its misalignment");
     snapshot.buffers[0].dwords[0] &= ~3u;
     info.buffers[1].typedAlignment = 2u;
     snapshot.buffers[1].dwords[0] |= 2u;
@@ -1504,6 +1507,10 @@ std::vector<PlanFixture> planFixtures() {
     add("bindless material table", 64, {0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x93109010u, 0xf4200406u, 0x20000004u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u}, srtPointer, {{PlanSrtAddress, tables}, {PlanTableAddress, heap}, {PlanMaterialAddress, materials}});
     add("bindless whole table", 64, {0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u}, srtPointer, {{PlanSrtAddress, tables}, {PlanTableAddress, heap}, {PlanMaterialAddress, materials}});
     add("bindless sample in a loop latch", 64, {0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xbea80380u, 0xf09c0f08u, 0x00450000u, 0x80288128u, 0xbf0a8428u, 0xbf85fffbu, 0xe0700000u, 0x80070000u, 0xbf810000u}, srtPointer, {{PlanSrtAddress, tables}, {PlanTableAddress, heap}, {PlanMaterialAddress, materials}});
+    auto keyed = tables;
+    keyed.resize(20u, 0u);
+    keyed[16] = 3u;
+    add("bindless selected record", 64, {0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0xf4000400u, 0xfa000040u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u}, srtPointer, {{PlanSrtAddress, keyed}, {PlanTableAddress, heap}, {PlanMaterialAddress, materials}});
 
     std::vector<std::uint32_t> phis(32, 0u);
     place(phis, 0, imageWords(PlanTextureAddress));
@@ -1649,6 +1656,9 @@ IrResourcePlan handBuiltPlan() {
     table.dwordCount = 8u;
     table.dwords[0] = &readConst(3);
     table.tableColumn = TableColumn{2u, 32u, 16u, 4u, 8u, 0xffu, false, true, {KeyDomain{3u, 4u, 16u, false}, KeyDomain{2u, 8u, 4u, true}}, false};
+    table.tableColumn->selected = true;
+    table.tableColumn->selection = 2u;
+    table.tableColumn->pointerHops = {PointerHop{0u, 0x10u}, PointerHop{8u, 0x20u}};
     DescriptorSource heap;
     heap.dwordCount = 4u;
     heap.dwords[1] = &readConst(6);
@@ -1897,6 +1907,7 @@ void verifyMalformedPlans() {
     rejects("a uniform fill of five words", [](IrResourcePlan& plan) { plan.uniformFill.fill.words = 5u; });
     rejects("an image table heap past the sources", [](IrResourcePlan& plan) { plan.descriptorSources[1].tableColumn->heapSource = 4u; });
     rejects("an image table key past the sources", [](IrResourcePlan& plan) { plan.descriptorSources[1].tableColumn->keyDomains[1].source = 4u; });
+    rejects("an image table selection past the sources", [](IrResourcePlan& plan) { plan.descriptorSources[1].tableColumn->selection = 4u; });
     auto foreign = handBuiltPlan();
     IrValue stray(IrOpcode::Void, IrType::U32, 99u);
     foreign.srtReads[0].value = &stray;
@@ -1950,12 +1961,76 @@ void verifyPlanRoundTrip() {
         std::cout << "plan round trip: " << fixture.name << ", " << plan->valueStorage.Size() << " values, " << ShaderDiskCache::EncodePlanEntry(key, *plan).size() << " bytes per entry, " << succeeded << " of 1000 runtimes materialized\n";
         ++index;
     }
+    auto releaseFixture = fixtures.front();
+    releaseFixture.waveSize = 32u;
+    auto registeredRequest = releaseFixture.Request(true);
+    const auto registeredHandle = PrepareShader(registeredRequest);
+    const auto registeredPlan = GetResourcePlan(registeredRequest);
+    ShaderDiskCache::Flush();
+    ReleaseUndrawnResourcePlan(*registeredHandle);
+    const auto beforeReload = ShaderDiskCache::Totals();
+    const auto reloadedPlan = GetResourcePlan(registeredRequest);
+    require(ShaderDiskCache::Totals().planHits == beforeReload.planHits + 1u, "a released registration plan was not reloaded from the disk cache");
+    require(samePlan(*registeredPlan, *reloadedPlan), "a released registration plan changed when reloaded");
+
+    auto reloadFixture = fixtures.front();
+    reloadFixture.waveSize = 32u;
+    reloadFixture.code.insert(reloadFixture.code.begin(), 0xbf800004u);
+    const auto reloadRequest = reloadFixture.Request(true);
+    const auto reloadHandle = PrepareShader(reloadRequest);
+    static_cast<void>(GetResourcePlan(reloadRequest));
+    ShaderDiskCache::Flush();
+    std::vector<std::byte> reloadKey;
+    ShaderDiskCache::BuildPlanKey(reloadRequest, 32u, reloadKey);
+    const auto reloadPath = ShaderDiskCache::EntryDirectory() / ShaderDiskCache::EntryName(reloadKey);
+    require(std::filesystem::is_regular_file(reloadPath), "the reload regression plan was not persisted");
+    const auto preservedPath = reloadPath.string() + ".reload-preserved";
+    std::filesystem::rename(reloadPath, preservedPath);
+    ReleaseUndrawnResourcePlan(*reloadHandle);
+    static_cast<void>(GetResourcePlan(reloadRequest));
+    auto secondLayout = reloadRequest;
+    secondLayout.layout.pushConstantSizeBytes = 0u;
+    ShaderPreparationContext preparation;
+    static_cast<void>(PrepareShader(secondLayout, &preparation));
+    require(preparation.ResourcePrograms() == 1u, "a plan reload retained full IR after an artifact for that layout was already available");
+
+    auto relocatedFixture = fixtures.front();
+    relocatedFixture.waveSize = 32u;
+    relocatedFixture.code.insert(relocatedFixture.code.begin(), 0xbf800005u);
+    const auto relocatedRequest = relocatedFixture.Request(true);
+    const auto relocatedHandle = PrepareShader(relocatedRequest);
+    static_cast<void>(GetResourcePlan(relocatedRequest));
+    ShaderDiskCache::Flush();
+    std::vector<std::byte> relocatedKey;
+    ShaderDiskCache::BuildPlanKey(relocatedRequest, 32u, relocatedKey);
+    const auto relocatedPath = ShaderDiskCache::EntryDirectory() / ShaderDiskCache::EntryName(relocatedKey);
+    std::filesystem::rename(relocatedPath, relocatedPath.string() + ".reload-preserved");
+    ReleaseUndrawnResourcePlan(*relocatedHandle);
+    auto drawn = relocatedRequest;
+    drawn.layout.pushConstantOffsetBytes = 16u;
+    drawn.layout.pushConstantSizeBytes = 112u;
+    const auto relocatedInvocation = PreparedShaderInvocation::TryCreate(drawn, relocatedHandle);
+    require(relocatedInvocation.has_value(), "the prepared artifact refused a relocated push layout");
+    RequestMemoryView drawnMemory(drawn.context.memory);
+    static_cast<void>(relocatedInvocation->Materialize(*relocatedInvocation->Capture(drawnMemory.MakeRuntime(drawn.context.userData, drawn.shader.codeAddress))));
+    auto relocatedProbe = relocatedRequest;
+    relocatedProbe.layout.pushConstantSizeBytes = 0u;
+    ShaderPreparationContext relocatedPreparation;
+    static_cast<void>(PrepareShader(relocatedProbe, &relocatedPreparation));
+    require(relocatedPreparation.ResourcePrograms() == 1u, "a plan reload retained full IR after the prepared artifact served a relocated push layout");
+
+    RequestMemoryView registeredMemory(registeredRequest.context.memory);
+    const auto runtimeCapture = CaptureResources(registeredRequest, registeredMemory.MakeRuntime(registeredRequest.context.userData, registeredRequest.shader.codeAddress), *registeredHandle);
+    const auto beforeKeep = ShaderDiskCache::Totals();
+    ReleaseUndrawnResourcePlan(*registeredHandle);
+    require(GetResourcePlan(registeredRequest) == runtimeCapture->plan && ShaderDiskCache::Totals().planHits == beforeKeep.planHits, "a runtime-captured plan was released");
     const auto covers = [&](const std::function<bool(const IrResourcePlan&)>& predicate) {
         return std::any_of(plans.begin(), plans.end(), [&](const std::shared_ptr<const IrResourcePlan>& plan) { return predicate(*plan); });
     };
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const DescriptorSource& source) { return source.tableColumn.has_value() && source.tableColumn->keyDomains.empty(); }); }), "no fixture plans a whole image table");
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const DescriptorSource& source) { return source.tableColumn.has_value() && !source.tableColumn->keyDomains.empty(); }); }), "no fixture plans an image table with a key domain");
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const DescriptorSource& source) { return source.tableColumn.has_value() && source.tableColumn->address; }); }), "no fixture plans an image table through a pointer");
+    require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const DescriptorSource& source) { return source.tableColumn.has_value() && source.tableColumn->selected; }); }), "no fixture plans a selected image table record");
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.controlFlow.begin(), plan.controlFlow.end(), [](const ResourceBlock& block) { return block.condition != nullptr; }); }), "no fixture plans a control-flow condition");
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.valueStorage.begin(), plan.valueStorage.end(), [](const auto& value) { return value.IsPhi(); }); }), "no fixture plans a phi");
     require(covers([](const IrResourcePlan& plan) { return !plan.guardedSrtSlots.empty(); }), "no fixture plans a guarded SRT read");

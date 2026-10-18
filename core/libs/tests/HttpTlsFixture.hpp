@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <cstdint>
+namespace HttpTlsFixture {
 inline constexpr char ServerPem[] = R"FIXTURE(-----BEGIN CERTIFICATE-----
 MIIBkzCCATmgAwIBAgIUVYuSIjPaKxxpXvpZcxSdjz3IKv8wCgYIKoZIzj0EAwIw
 QjELMAkGA1UEBhMCR0IxFTATBgNVBAoMDEFueVBTNSBUZXN0czEcMBoGA1UEAwwT
@@ -76,3 +77,4 @@ inline constexpr std::array<std::uint8_t, 138> ClientKeyDer{
     0x49, 0x56, 0x87, 0x4a, 0xc8, 0x6a, 0xa4, 0x2a, 0xee, 0xbc, 0xc8, 0x4a, 0xed, 0x3e, 0x98, 0xaf,
     0x9e, 0x7b, 0x5e, 0x9b, 0x24, 0x2d, 0xea, 0x75, 0x6b, 0x17,
 };
+}

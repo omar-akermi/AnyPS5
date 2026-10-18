@@ -112,7 +112,8 @@ enum class ConservativeZExport : std::uint8_t {
 
 enum class ColorExportPacking : std::uint8_t {
     None,
-    Unorm10_11_11
+    Unorm10_11_11,
+    Float11_11_10
 };
 
 enum class RasterPrimitive : std::uint8_t {
@@ -268,6 +269,7 @@ struct SpirvTarget {
     bool vertexSubgroups = true;
     bool float16DenormPreserve = false;
     bool spannedWaves = false;
+    bool robustBufferAccess2 = false;
 };
 
 struct BindingLayout {
@@ -380,7 +382,8 @@ enum class DescriptorImageShape {
     ImageCube,
     Image3D,
     Image1DArray,
-    Image2DMultisample
+    Image2DMultisample,
+    Image2DMultisampleArray
 };
 
 enum class DescriptorRole {
@@ -426,6 +429,7 @@ struct DescriptorBinding {
     std::vector<bool> bufferWritten;
     std::vector<bool> samplerUnnormalized;
     std::vector<bool> samplerIntegerBorder;
+    std::vector<bool> samplerCoordinatesIgnored;
     std::vector<bool> imageUnnormalized;
     std::vector<bool> imageUnnormalizedBaseLevel;
     std::vector<std::uint32_t> imageSamplers;
@@ -698,6 +702,13 @@ struct GeometryStageLimits {
 };
 
 [[nodiscard]] RecompileResult BuildBarycentricGeometryShader(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, const std::optional<GeometryStageLimits>& limits);
+
+struct BarycentricTessellationShaders {
+    RecompileResult control;
+    RecompileResult evaluation;
+};
+
+[[nodiscard]] BarycentricTessellationShaders BuildBarycentricTessellationShaders(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, std::uint32_t maxFragmentInputComponents);
 
 }
 
