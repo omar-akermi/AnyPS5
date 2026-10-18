@@ -1,0 +1,36 @@
+name: HTTP integration Linux validation
+on:
+  push:
+    branches: ['codex/http-linux-validation-*']
+permissions:
+  contents: read
+jobs:
+  linux-runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sanitizer: 'OFF'
+            configuration: Release
+          - sanitizer: 'ON'
+            configuration: RelWithDebInfo
+    name: Linux runtime (ASAN ${{ matrix.sanitizer }})
+    env:
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: 1d5b1bcfad9f807845c657acf12640c5d69e529a
+          submodules: recursive
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-14 g++-14 cmake ninja-build python3 libx11-dev libxext-dev libxrandr-dev libwayland-dev libxkbcommon-dev libegl-dev libdecor-0-dev libpipewire-0.3-dev libpulse-dev libasound2-dev
+      - name: Configure full project
+        run: cmake -S . -B build-validation -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.configuration }} -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 -DANYPS5_ENABLE_ASAN=${{ matrix.sanitizer }}
+      - name: Build HTTP and SSL runtime tests
+        run: cmake --build build-validation --parallel 4 --target guest_http_tests guest_http_transport_tests guest_http_response_header_tests guest_http2_tests guest_offline_imports_tests guest_netctl_ap_dialog_tests guest_ssl_tests guest_ssl_load_tests guest_ssl_transport_tests
+      - name: Test HTTP and native SSL
+        run: ctest --test-dir build-validation -R '^(guest_http.*|guest_ssl.*|guest_offline_imports|guest_netctl_ap_dialog)$' --output-on-failure
