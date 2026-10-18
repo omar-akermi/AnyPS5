@@ -22,8 +22,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 1d5b1bcfad9f807845c657acf12640c5d69e529a
+          ref: 76af9fcda39dbc25e52d4aa0c4393bb8a7cfa0ac
           submodules: recursive
+      - name: Verify checked-out revision
+        run: test "$(git rev-parse HEAD)" = "76af9fcda39dbc25e52d4aa0c4393bb8a7cfa0ac"
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -31,6 +33,6 @@ jobs:
       - name: Configure full project
         run: cmake -S . -B build-validation -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.configuration }} -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 -DANYPS5_ENABLE_ASAN=${{ matrix.sanitizer }}
       - name: Build HTTP and SSL runtime tests
-        run: cmake --build build-validation --parallel 4 --target guest_http_tests guest_http_transport_tests guest_http_response_header_tests guest_http2_tests guest_offline_imports_tests guest_netctl_ap_dialog_tests guest_ssl_tests guest_ssl_load_tests guest_ssl_transport_tests
+        run: cmake --build build-validation --parallel 4 --target guest_http_tests guest_http_transport_tests guest_http_response_header_tests guest_http2_tests guest_offline_imports_tests guest_netctl_ap_dialog_tests guest_ssl_tests guest_ssl_load_tests guest_ssl_transport_tests guest_math_tests
       - name: Test HTTP and native SSL
-        run: ctest --test-dir build-validation -R '^(guest_http.*|guest_ssl.*|guest_offline_imports|guest_netctl_ap_dialog)$' --output-on-failure
+        run: ctest --test-dir build-validation -R '^(guest_http.*|guest_ssl.*|guest_offline_imports|guest_netctl_ap_dialog|guest_math)$' --output-on-failure
