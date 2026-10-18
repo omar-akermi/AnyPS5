@@ -79,7 +79,7 @@ if(BUILD_TESTING)
         target_include_directories(guest_http_transport_tests PRIVATE ${LIBS_INCLUDE_DIR})
         target_link_libraries(guest_http_transport_tests PRIVATE libSceHttp libSceSsl libc)
         configure_windows_unwind(guest_http_transport_tests)
-        foreach(mode IN ITEMS basic streaming failures lifecycle contexts session async tls mutual expired async_tls framing tunnel tunnel_tls phases authorities auto_proxy verification sni)
+        foreach(mode IN ITEMS basic streaming failures lifecycle contexts session async tls mutual expired async_tls framing tunnel tunnel_tls phases authorities auto_proxy verification sni minimum12 minimum13)
             add_test(NAME guest_http_transport_${mode} COMMAND ${Python3_EXECUTABLE}
                 ${LIBS_INCLUDE_DIR}/tests/run_http_transport.py $<TARGET_FILE:guest_http_transport_tests> ${mode})
             set_tests_properties(guest_http_transport_${mode} PROPERTIES TIMEOUT 25)

@@ -193,16 +193,15 @@ int APS5_VABI sceHttpInit_nid_postfix(int memid, int ssl_ctx_id, uint64_t pool_s
 }
 
 int APS5_VABI sceHttpSetAuthEnabled(int id, int enable) {
-    if (HttpHasObject_nid_no_patch(id) && (enable != 0)) NotImplemented_nid_no_patch(__func__);
-    (void)id;
-    (void)enable;
+    if (!HttpHasObject_nid_no_patch(id)) return ERROR_INVALID_ID;
+    if (enable != 0 && enable != 1) return ERROR_INVALID_VALUE;
+    if (enable) NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
 int APS5_VABI sceHttpSetAuthInfoCallback(int id, HttpAuthInfoCallback callback, void* userArg) {
-    if (HttpHasObject_nid_no_patch(id) && (callback != nullptr)) NotImplemented_nid_no_patch(__func__);
-    (void)id;
-    (void)callback;
+    if (!HttpHasObject_nid_no_patch(id)) return ERROR_INVALID_ID;
+    if (callback) NotImplemented_nid_no_patch(__func__);
     (void)userArg;
     return 0;
 }
@@ -359,17 +358,15 @@ int APS5_VABI sceHttpParseResponseHeader(const char* header, std::size_t headerL
 }
 
 int APS5_VABI sceHttpSetCookieRecvCallback(int id, HttpCookieRecvCallback cbfunc, void* user_arg) {
-    if (HttpHasObject_nid_no_patch(id) && (cbfunc != nullptr)) NotImplemented_nid_no_patch(__func__);
-    (void)id;
-    (void)cbfunc;
+    if (!HttpHasObject_nid_no_patch(id)) return ERROR_INVALID_ID;
+    if (cbfunc) NotImplemented_nid_no_patch(__func__);
     (void)user_arg;
     return 0;
 }
 
 int APS5_VABI sceHttpSetRedirectCallback(int id, HttpRedirectCallback cbfunc, void* user_arg) {
-    if (HttpHasObject_nid_no_patch(id) && (cbfunc != nullptr)) NotImplemented_nid_no_patch(__func__);
-    (void)id;
-    (void)cbfunc;
+    if (!HttpHasObject_nid_no_patch(id)) return ERROR_INVALID_ID;
+    if (cbfunc) NotImplemented_nid_no_patch(__func__);
     (void)user_arg;
     return 0;
 }

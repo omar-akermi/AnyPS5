@@ -60,6 +60,7 @@ int APS5_VABI sceHttpsGetSslError(int, int*, std::uint32_t*);
 int APS5_VABI sceHttpsDisableOption(int, std::uint32_t);
 int APS5_VABI sceHttpsEnableOption(int, std::uint32_t);
 int APS5_VABI sceHttpsSetSslVersion(int, int);
+int APS5_VABI sceHttpsSetMinSslVersion(int, std::uint32_t);
 int APS5_VABI sceHttpsSetSslCallback(int, HttpsCallback, void*);
 int APS5_VABI sceHttpsGetCaList(int, SceSsl::CaList*);
 int APS5_VABI sceHttpsFreeCaList(int, SceSsl::CaList*);
@@ -428,6 +429,21 @@ static void Expired(int context, int connection) {
     Require(sceHttpSendRequest(request, nullptr, 0) == 0);
     Require(Read(request).size() == 1024);
     Require(sceHttpDeleteRequest(request) == 0);
+}
+
+static void MinimumVersion(int context, int connection) {
+    auto authority = Certificate(RootPem);
+    auto* pointer = &authority;
+    Require(sceHttpsLoadCert(context, 1, &pointer, nullptr, nullptr) == 0);
+    Require(sceHttpsSetMinSslVersion(connection, 6) == InvalidValue);
+    Require(sceHttpsSetMinSslVersion(connection, UINT32_MAX) == InvalidValue);
+    for (std::uint32_t version = 0; version <= 5; ++version) {
+        const int request = Request(connection, "/binary");
+        Require(sceHttpsSetMinSslVersion(request, version) == 0);
+        Require(sceHttpSendRequest(request, nullptr, 0) == 0);
+        Require(Read(request).size() == 1024);
+        Require(sceHttpDeleteRequest(request) == 0);
+    }
 }
 
 static void Sni(int context, int connection, const char* url) {
@@ -991,6 +1007,7 @@ int main(int argc, char** argv) {
     else if (mode == "tls" || mode == "mutual") Tls(context, connection, argv[1], mode == "mutual");
     else if (mode == "expired") Expired(context, connection);
     else if (mode == "sni") Sni(context, connection, argv[1]);
+    else if (mode == "minimum12" || mode == "minimum13") MinimumVersion(context, connection);
     else if (mode == "lifecycle") { Lifecycle(context, connection); return 0; }
     else if (mode == "contexts") { Contexts(context, connection, argv[1]); return 0; }
     else Require(false);

@@ -55,6 +55,7 @@ struct Settings {
     void* epollArgument = nullptr;
     std::uint32_t verify = 0xfd;
     long tlsVersion = CURL_SSLVERSION_TLSv1_2;
+    std::uint32_t minimumTlsVersion = 0;
     std::string authorities;
     std::vector<unsigned char> certificate;
     std::vector<unsigned char> key;
@@ -955,8 +956,8 @@ int APS5_VABI sceHttpsDisableOption(int id, std::uint32_t flags) {
 }
 
 int APS5_VABI sceHttpsSetMinSslVersion(int id, std::uint32_t version) {
-    if (version != 0 && version != 5) NotImplemented_nid_no_patch(__func__);
-    return Configure(id, [&](Object& object) { object.settings.tlsVersion = CURL_SSLVERSION_TLSv1_2; return 0; });
+    if (version > 5) return ERROR_INVALID_VALUE;
+    return Configure(id, [&](Object& object) { object.settings.minimumTlsVersion = version; return 0; });
 }
 
 int APS5_VABI sceHttpsSetSslCallback(int id, HttpsCallback callback, void* argument) {
@@ -1188,10 +1189,14 @@ int APS5_VABI sceHttpSendRequest(int id, const void* data, std::size_t size) {
     set(CURLOPT_MAXREDIRS, 10L);
     set(CURLOPT_SSL_VERIFYPEER, (request->settings.verify & 1) ? 1L : 0L);
     set(CURLOPT_SSL_VERIFYHOST, (request->settings.verify & 4) ? 2L : 0L);
-    set(CURLOPT_SSLVERSION, request->settings.tlsVersion);
+    constexpr long minimumVersions[] = {CURL_SSLVERSION_DEFAULT, CURL_SSLVERSION_SSLv2, CURL_SSLVERSION_SSLv3,
+        CURL_SSLVERSION_TLSv1_0, CURL_SSLVERSION_TLSv1_1, CURL_SSLVERSION_TLSv1_2};
+    const long minimum = std::max<long>(CURL_SSLVERSION_TLSv1_2, minimumVersions[request->settings.minimumTlsVersion]);
+    const long tlsVersion = std::max(minimum, request->settings.tlsVersion & 0xffffL) | (request->settings.tlsVersion & ~0xffffL);
+    set(CURLOPT_SSLVERSION, tlsVersion);
     set(CURLOPT_PROXY_SSL_VERIFYPEER, (request->settings.verify & 1) ? 1L : 0L);
     set(CURLOPT_PROXY_SSL_VERIFYHOST, (request->settings.verify & 4) ? 2L : 0L);
-    set(CURLOPT_PROXY_SSLVERSION, request->settings.tlsVersion);
+    set(CURLOPT_PROXY_SSLVERSION, tlsVersion);
     set(CURLOPT_SSL_SESSIONID_CACHE, (request->settings.verify & 0x40) ? 1L : 0L);
     set(CURLOPT_SSL_CTX_FUNCTION, ConfigureTls);
     set(CURLOPT_SSL_CTX_DATA, request.get());

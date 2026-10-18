@@ -179,11 +179,11 @@ if __name__ == "__main__":
 
     server = FixtureServer(("127.0.0.1", 0), Handler)
     server.upload_release = threading.Event()
-    secure = sys.argv[2] in ("tls", "mutual", "expired", "async_tls", "tunnel_tls", "verification", "sni")
+    secure = sys.argv[2] in ("tls", "mutual", "expired", "async_tls", "tunnel_tls", "verification", "sni", "minimum12", "minimum13")
     if secure:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.minimum_version = ssl.TLSVersion.TLSv1_2
-        context.maximum_version = ssl.TLSVersion.TLSv1_2
+        context.minimum_version = ssl.TLSVersion.TLSv1_3 if sys.argv[2] == "minimum13" else ssl.TLSVersion.TLSv1_2
+        context.maximum_version = context.minimum_version
         context.set_servername_callback(lambda connection, name, _: setattr(connection, "http_sni", name))
         context.load_cert_chain(certificate("ExpiredPem" if sys.argv[2] == "expired" else "ServerPem", "HttpTlsFixture.hpp"),
                                 certificate("ServerKey", "HttpTlsFixture.hpp"))
