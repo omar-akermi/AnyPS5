@@ -15,11 +15,15 @@ project(mini C)
 include(CheckIncludeFile)
 include(CheckSymbolExists)
 include(CheckCSourceCompiles)
+include(CheckTypeSize)
 check_include_file(stdio.h MINI_HAVE_STDIO_H)
 check_include_file(mini_missing_header.h MINI_HAVE_MISSING_H)
 check_symbol_exists(printf stdio.h MINI_HAVE_PRINTF)
 check_c_source_compiles("int main(void) { return 0; }" MINI_COMPILES)
 check_c_source_compiles("int main(void) { return undefined_name; }" MINI_FAILS)
+check_type_size(long MINI_LONG_BYTES)
+check_type_size("struct mini_missing_type" MINI_MISSING_BYTES)
+configure_file(sizes.h.in sizes.h @ONLY)
 set(MINI_OPTION "value" CACHE STRING "An option, not a check result")
 """
 
@@ -41,6 +45,7 @@ class ConfigureSeedTests(unittest.TestCase):
         cls.root = Path(cls.directory.name)
         (cls.root / "source").mkdir()
         (cls.root / "source" / "CMakeLists.txt").write_text(PROJECT, encoding="utf-8")
+        (cls.root / "source" / "sizes.h.in").write_text("@MINI_LONG_BYTES_CODE@\n@MINI_MISSING_BYTES_CODE@\n", encoding="utf-8")
         cls.compiler = shutil.which("gcc") or shutil.which("cc")
         cls.fresh = cls.configure("fresh")
 
@@ -61,16 +66,20 @@ class ConfigureSeedTests(unittest.TestCase):
     def test_seeded_configure_runs_no_check_and_gets_the_same_results(self):
         self.assertRegex(self.fresh, r"Looking for|Performing Test")
         output = self.configure("seeded", "-C", str(self.seed(self.root / "fresh" / "CMakeCache.txt", "seed.cmake")))
-        self.assertNotRegex(output, r"Looking for|Performing Test")
+        self.assertNotRegex(output, r"Looking for|Performing Test|Check size of")
         fresh = configure_seed.checks(self.root / "fresh" / "CMakeCache.txt")
         self.assertEqual(configure_seed.checks(self.root / "seeded" / "CMakeCache.txt"), fresh)
         self.assertEqual(fresh["MINI_HAVE_STDIO_H"][0], "1")
         self.assertEqual(fresh["MINI_FAILS"][0], "")
+        self.assertEqual((self.root / "seeded" / "sizes.h").read_text(), (self.root / "fresh" / "sizes.h").read_text())
+        self.assertGreater(int(fresh["MINI_LONG_BYTES"][0]), 0)
+        self.assertEqual(fresh["MINI_MISSING_BYTES"][0], "")
 
     def test_only_check_results_are_seeded(self):
         found = configure_seed.checks(self.root / "fresh" / "CMakeCache.txt")
         self.assertEqual({n for n in found if n.startswith("MINI_")},
-                         {"MINI_HAVE_STDIO_H", "MINI_HAVE_MISSING_H", "MINI_HAVE_PRINTF", "MINI_COMPILES", "MINI_FAILS"})
+                         {"MINI_HAVE_STDIO_H", "MINI_HAVE_MISSING_H", "MINI_HAVE_PRINTF", "MINI_COMPILES", "MINI_FAILS",
+                          "MINI_LONG_BYTES", "MINI_MISSING_BYTES"})
         self.assertNotIn("CMAKE_C_COMPILER", found)
 
     def test_values_with_cmake_syntax_round_trip(self):

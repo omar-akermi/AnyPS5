@@ -201,6 +201,7 @@ struct Server {
             mbedtls_ssl_set_bio(&ssl, &client, mbedtls_net_send, mbedtls_net_recv, nullptr);
             const int handshake = mbedtls_ssl_handshake(&ssl);
             if (handshake != 0) failure = "server handshake failed, error " + std::to_string(handshake);
+            else if (mbedtls_ssl_get_version_number(&ssl) != MBEDTLS_SSL_VERSION_TLS1_2) failure = "native SSL negotiated outside TLS 1.2";
             else if (mode == Serve::Exchange) Exchange(ssl);
             else if (mode == Serve::Close) mbedtls_ssl_close_notify(&ssl);
             else if (mode == Serve::Reset) Reset(ssl, client);
@@ -216,7 +217,8 @@ struct Server {
             return;
         }
         linger immediate{1, 0};
-        setsockopt(client.fd, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&immediate), sizeof(immediate));
+        Require(setsockopt(client.fd, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&immediate), sizeof(immediate)) == 0,
+            "set immediate reset linger");
 #ifdef _WIN32
         closesocket(client.fd);
 #else
@@ -425,7 +427,9 @@ int main(int argc, char** argv) {
     const int reset = sceSslCreateConnection(context, resetSocket, "localhost");
     Require(sceSslConnect(reset) == 0, "handshake before the server resets the connection");
     Require(sceSslWrite(reset, request, 1, 0) == 1, "write the byte the server resets after");
-    Require(sceSslRead(reset, buffer.data(), buffer.size(), 0) == ErrorSocketClosed, "a reset did not report the closed socket");
+    const int resetRead = sceSslRead(reset, buffer.data(), buffer.size(), 0);
+    if (resetRead != ErrorSocketClosed) std::fprintf(stderr, "Reset read returned %08x\n", static_cast<unsigned>(resetRead));
+    Require(resetRead == ErrorSocketClosed, "a reset did not report the closed socket");
     Require(sceSslDeleteConnection(reset) == 0 && sockets.Close(resetSocket) == 0, "release the reset connection");
 
     if (sockets.net) {

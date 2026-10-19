@@ -9,8 +9,14 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <stdexcept>
 
 extern "C" {
+int APS5_VABI sceHttpCreateTemplate(int, const char*, int, int);
+int APS5_VABI sceHttpCreateConnectionWithURL(int, const char*, int);
+int APS5_VABI sceHttpDeleteRequest(int);
+int APS5_VABI sceHttpDeleteConnection(int);
+int APS5_VABI sceHttpDeleteTemplate(int);
 int APS5_VABI sceHttpUriParse(SceHttpUriElement*, const char*, void*, std::size_t*, std::size_t);
 int APS5_VABI sceHttpUriMerge(char*, const char*, const char*, std::size_t*, std::size_t, std::uint32_t);
 int APS5_VABI sceHttpSetInflateGZIPEnabled(int, int);
@@ -40,6 +46,7 @@ int APS5_VABI sceHttpsGetSslError(int, int*, std::uint32_t*);
 int APS5_VABI sceHttpSetRedirectCallback(int, HttpRedirectCallback, void*);
 int APS5_VABI sceHttpSetCookieRecvCallback(int, HttpCookieRecvCallback, void*);
 int APS5_VABI sceHttpSetAuthInfoCallback(int, HttpAuthInfoCallback, void*);
+int APS5_VABI sceHttpSetAuthEnabled(int, int);
 int APS5_VABI sceHttpParseStatusLine(const char*, std::size_t, std::int32_t*, std::int32_t*, std::int32_t*, const char**, std::size_t*);
 }
 
@@ -68,19 +75,26 @@ static void CheckUriEscapeBytes() {
     }
 }
 
-static int AuthInfo(int, int, const char*, char*, char*, int, std::uint8_t**, std::uint64_t*, int*, void*) { std::abort(); }
+static int APS5_VABI AuthInfo(int, int, const char*, char*, char*, int, std::uint8_t**, std::uint64_t*, int*, void*) { std::abort(); }
 static void APS5_VABI RequestStatusCallback(int, int, void* argument) {
     ++*static_cast<int*>(argument);
 }
 
 int main() {
     int callbackCount = 0;
-    const auto request = sceHttpCreateRequest2(1, "GET", "/", 0);
+    const int callbackContext = sceHttpInit_nid_postfix(0, 0, 65536);
+    const int callbackTemplate = sceHttpCreateTemplate(callbackContext, "test", 2, 0);
+    const int callbackConnection = sceHttpCreateConnectionWithURL(callbackTemplate, "http://127.0.0.1:1/", 0);
+    const auto request = sceHttpCreateRequest2(callbackConnection, "GET", "/", 0);
     Require(sceHttpSetRequestStatusCallback(request, RequestStatusCallback, &callbackCount) == 0);
     Require(sceHttpSendRequest(request, nullptr, 0) == static_cast<int>(0x80431063u));
-    Require(callbackCount == 0);
+    Require(callbackCount > 0);
     Require(sceHttpSetRequestStatusCallback(request, nullptr, nullptr) == 0);
     Require(sceHttpSetRequestStatusCallback(-1, RequestStatusCallback, &callbackCount) == static_cast<int>(0x80431100u));
+    Require(sceHttpDeleteRequest(request) == 0);
+    Require(sceHttpDeleteConnection(callbackConnection) == 0);
+    Require(sceHttpDeleteTemplate(callbackTemplate) == 0);
+    Require(sceHttpTerm_nid_postfix(callbackContext) == 0);
     constexpr int outOfMemory = static_cast<int>(0x80431022);
     constexpr int invalidValue = static_cast<int>(0x804311FE);
     constexpr int invalidUrl = static_cast<int>(0x80433060);
@@ -311,33 +325,34 @@ int main() {
     Require(sceHttpTerm_nid_postfix(context) == beforeInit);
 
     char data[16];
-    Require(sceHttpReadData(1, data, sizeof(data)) == network);
+    Require(sceHttpReadData(1, data, sizeof(data)) == invalidId);
 
-    Require(sceHttpCreateRequest2(1, "GET", "/", 0) > 0);
-    Require(sceHttpSetInflateGZIPEnabled(1, 0) == 0);
-    Require(sceHttpSetInflateGZIPEnabled(1, 1) == 0);
+    Require(sceHttpCreateRequest2(1, "GET", "/", 0) == invalidId);
+    Require(sceHttpSetInflateGZIPEnabled(1, 0) == invalidId);
+    Require(sceHttpSetInflateGZIPEnabled(1, 1) == invalidId);
     Require(sceHttpSetInflateGZIPEnabled(1, 2) == invalidValue);
     Require(sceHttpSetInflateGZIPEnabled(1, -1) == invalidValue);
-    Require(sceHttpsEnableOption(1, 0) == 0);
-    Require(sceHttpsLoadCert(1, 0, nullptr, nullptr, nullptr) == 0);
-    Require(sceHttpsUnloadCert(1) == 0);
-    Require(sceHttpSetResponseHeaderMaxSize(1, 8192) == 0);
-    Require(sceHttpSetRecvBlockSize(1, 0x4000) == 0);
+    Require(sceHttpsEnableOption(1, 0) == invalidId);
+    Require(sceHttpsLoadCert(1, 0, nullptr, nullptr, nullptr) == invalidId);
+    Require(sceHttpsUnloadCert(1) == invalidId);
+    Require(sceHttpSetResponseHeaderMaxSize(1, 8192) == invalidId);
+    Require(sceHttpSetRecvBlockSize(1, 0x4000) == invalidId);
     Require(sceHttpRedirectCacheFlush(1) == 0);
     int authUserArg = 0;
-    Require(sceHttpSetAuthInfoCallback(1, AuthInfo, &authUserArg) == 0);
-    Require(sceHttpReadData(1, data, sizeof(data)) == network);
+    Require(sceHttpSetAuthInfoCallback(1, AuthInfo, &authUserArg) == invalidId);
+    Require(sceHttpSetAuthEnabled(1, 0) == invalidId);
+    Require(sceHttpReadData(1, data, sizeof(data)) == invalidId);
     int httpErrno = -1;
-    Require(sceHttpGetLastErrno(1, &httpErrno) == 0);
-    Require(httpErrno == 0);
+    Require(sceHttpGetLastErrno(1, &httpErrno) == invalidId);
+    Require(httpErrno == -1);
     Require(sceHttpGetLastErrno(1, nullptr) == invalidValue);
-    Require(sceHttpsSetSslVersion(1, 0) == 0);
-    Require(sceHttpSetRedirectCallback(1, nullptr, nullptr) == 0);
-    Require(sceHttpSetCookieRecvCallback(1, nullptr, nullptr) == 0);
+    Require(sceHttpsSetSslVersion(1, 0) == invalidId);
+    Require(sceHttpSetRedirectCallback(1, nullptr, nullptr) == invalidId);
+    Require(sceHttpSetCookieRecvCallback(1, nullptr, nullptr) == invalidId);
     int sslError = -1;
     std::uint32_t sslDetail = 0xFFFFFFFFu;
-    Require(sceHttpsGetSslError(1, &sslError, &sslDetail) == 0);
-    Require(sslError == 0 && sslDetail == 0);
+    Require(sceHttpsGetSslError(1, &sslError, &sslDetail) == invalidId);
+    Require(sslError == -1 && sslDetail == 0xFFFFFFFFu);
     Require(sceHttpsGetSslError(1, nullptr, &sslDetail) == invalidValue);
     Require(sceHttpsGetSslError(1, &sslError, nullptr) == invalidValue);
 

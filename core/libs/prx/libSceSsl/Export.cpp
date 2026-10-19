@@ -322,6 +322,7 @@ struct Session {
             "SSL client configuration failed");
         mbedtls_ssl_conf_authmode(&config, MBEDTLS_SSL_VERIFY_OPTIONAL);
         mbedtls_ssl_conf_min_tls_version(&config, MBEDTLS_SSL_VERSION_TLS1_2);
+        mbedtls_ssl_conf_max_tls_version(&config, MBEDTLS_SSL_VERSION_TLS1_2);
         mbedtls_ssl_conf_ca_chain(&config, &authorities, nullptr);
         mbedtls_ssl_conf_rng(&config, mbedtls_ctr_drbg_random, &random.drbg);
         if (identity)
@@ -586,6 +587,47 @@ void* ExtractCertName(const char* function, int sslCtxId, void* sslCert, bool su
 }
 
 extern "C" {
+
+bool SslContextExists_nid_no_patch(int sslCtxId) {
+    auto& state = State();
+    std::lock_guard lock(state.mutex);
+    return state.contexts.contains(sslCtxId);
+}
+
+int SslImportCaList_nid_no_patch(int sslCtxId, const SceSsl::Data* input, SceSsl::CaList* output) {
+    if (!input || !output) return ErrorInvalidArg;
+    auto& state = State();
+    std::lock_guard lock(state.mutex);
+    auto& context = GetContext(sslCtxId);
+    PoolScope scope(context.pool);
+    auto chain = ParseCertificate(*input);
+    std::vector<std::unique_ptr<CertificateHandle>> handles;
+    for (auto* entry = &chain->root; entry && entry->raw.p; entry = entry->next) {
+        auto handle = std::make_unique<CertificateHandle>(CertificateHandle{chain, entry});
+        chain->handles.push_back(handle.get());
+        handles.push_back(std::move(handle));
+    }
+    const auto count = handles.size();
+    if (count > static_cast<std::size_t>(std::numeric_limits<int>::max())) throw std::length_error("Too many HTTP authorities");
+    Snapshot snapshot{Allocate(count * sizeof(void*)), {chain}, count};
+    auto** pointers = reinterpret_cast<void**>(snapshot.data.get());
+    for (std::size_t index = 0; index < count; ++index) pointers[index] = handles[index].get();
+    context.certificateHandles.reserve(Add(context.certificateHandles.size(), count));
+    context.caLists.emplace(pointers, std::move(snapshot));
+    for (auto& handle : handles) context.certificateHandles.push_back(std::move(handle));
+    *output = {pointers, static_cast<int>(count)};
+    return 0;
+}
+
+void SslReleaseCaList_nid_no_patch(int sslCtxId, SceSsl::CaList list) {
+    auto& state = State();
+    std::lock_guard lock(state.mutex);
+    const auto context = state.contexts.find(sslCtxId);
+    if (context == state.contexts.end()) return;
+    const auto allocation = context->second->caLists.find(list.certs);
+    if (allocation == context->second->caLists.end() || list.num < 0 || allocation->second.count != static_cast<std::size_t>(list.num)) return;
+    context->second->caLists.erase(allocation);
+}
 
 int APS5_VABI sceSslInit_nid_postfix(std::uint64_t poolSize) {
     auto& state = State();
