@@ -586,7 +586,8 @@ private:
         std::uint32_t first = 0;
         bool address = false;
         for (std::uint32_t dword = 0; dword < words; dword++) {
-            IrValue* read = handle.Argument(dword)->Resolve();
+            IrValue* read = ResolveInvariantPhi(m_program.Resources(), handle.Argument(dword));
+            if (read == nullptr) return false;
             std::uint32_t memoryIndex = 0;
             const MemoryInfo* memory = ScalarReadMemory(*read, memoryIndex);
             const bool addressRead = memory == nullptr && (memory = ScalarAddressMemory(*read, memoryIndex)) != nullptr;
@@ -1816,6 +1817,9 @@ private:
             constexpr auto unsupported = RdnaImageSampleFlagLod | RdnaImageSampleFlagDerivative;
             if (op == IrOpcode::ImageGatherRaw || (memory.imageSampleFlags & unsupported) != 0u) image.emulatedCompare |= EmulatedCompare::Unsupported;
             if ((memory.imageSampleFlags & RdnaImageSampleFlagLevelZero) == 0u) image.emulatedCompare |= EmulatedCompare::RequiresSingleLevel;
+        } else if (ImageOpcodeInfoOf(op).needsSampler) {
+            if (op != IrOpcode::ImageSampleRaw) image.emulatedCompare |= EmulatedCompare::ConvertedSampleUnsupported;
+            if ((memory.imageSampleFlags & RdnaImageSampleFlagLevelZero) == 0u) image.emulatedCompare |= EmulatedCompare::ConvertedSampleRequiresSingleLevel;
         }
     }
 

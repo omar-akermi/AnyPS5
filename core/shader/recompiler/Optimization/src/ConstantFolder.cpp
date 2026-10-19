@@ -636,6 +636,10 @@ IrValue& insertBuiltin(IrProgram& program, IrBuilder& builder, IrValue& next, St
     return insertBefore(program, next, IrOpcode::GetBuiltin, builder.Constant(static_cast<std::uint32_t>(kind)), builder.Constant(0u));
 }
 
+IrValue& sampleNumber(IrProgram& program, IrBuilder& builder, IrValue& next) {
+    return program.Metadata().pixelIteratesSamples ? insertBuiltin(program, builder, next, StageInputKind::SampleId) : builder.Constant(0u);
+}
+
 void lowerPackedAncillary(IrProgram& program, IrBuilder& builder, IrValue& ancillary) {
     if (!isPackedAncillary(ancillary)) {
         return;
@@ -684,7 +688,7 @@ void lowerPackedAncillary(IrProgram& program, IrBuilder& builder, IrValue& ancil
     const auto field = [&](std::size_t index) -> IrValue& {
         if (fields[index] == nullptr && index == 1u) fields[index] = &insertBefore(program, ancillary, IrOpcode::IMul32, insertBuiltin(program, builder, ancillary, StageInputKind::Layer), insertBuiltin(program, builder, ancillary, StageInputKind::LayerExported));
         if (fields[index] == nullptr) {
-            fields[index] = &insertBuiltin(program, builder, ancillary, StageInputKind::SampleId);
+            fields[index] = &sampleNumber(program, builder, ancillary);
         }
         return *fields[index];
     };
@@ -1127,6 +1131,23 @@ void ConstantFolder::Fold(IrProgram& program, std::span<IrBlock* const> blocks) 
             const auto success = tryFoldValue(program, *inst, facts);
         }
     }
+    std::vector<IrValue*> phis;
+    for (IrBlock* block : blocks) {
+        for (IrValue* inst : block->Instructions()) {
+            if (inst->Opcode() == IrOpcode::Phi) {
+                phis.push_back(inst);
+            }
+        }
+    }
+    bool folded = true;
+    while (folded) {
+        folded = false;
+        for (IrValue* phi : phis) {
+            if (phi->Opcode() == IrOpcode::Phi && foldPhi(*phi)) {
+                folded = true;
+            }
+        }
+    }
     std::vector<IrValue*> words;
     for (IrBlock* block : blocks) {
         for (IrValue* inst : block->Instructions()) {
@@ -1173,7 +1194,7 @@ bool ConstantFolder::ComposePackedAncillary(IrProgram& program) const {
     IrBuilder builder(program);
     for (IrValue* word : words) {
         IrValue& primitive = insertBuiltin(program, builder, *word, StageInputKind::RasterPrimitive);
-        IrValue& sample = insertBefore(program, *word, IrOpcode::ShiftLeftLogical32, insertBuiltin(program, builder, *word, StageInputKind::SampleId), builder.Constant(8u));
+        IrValue& sample = insertBefore(program, *word, IrOpcode::ShiftLeftLogical32, sampleNumber(program, builder, *word), builder.Constant(8u));
         IrValue& exportedLayer = insertBefore(program, *word, IrOpcode::IMul32, insertBuiltin(program, builder, *word, StageInputKind::Layer), insertBuiltin(program, builder, *word, StageInputKind::LayerExported));
         IrValue& layer = insertBefore(program, *word, IrOpcode::ShiftLeftLogical32, exportedLayer, builder.Constant(16u));
         IrValue& fields = insertBefore(program, *word, IrOpcode::BitwiseOr32, sample, layer);

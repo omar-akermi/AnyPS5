@@ -87,7 +87,7 @@ namespace ShaderRecompiler::ShaderDiskCache {
 static_assert(sizeof(CompiledShaderArtifact) == 240, "CompiledShaderArtifact changed: update the artifact encoder");
 static_assert(sizeof(ShaderInvocation) == 200, "ShaderInvocation changed: update the invocation encoder");
 static_assert(sizeof(RecompileResult) == 472, "RecompileResult changed: update EncodeResult and DecodeResult");
-static_assert(sizeof(DescriptorBinding) == 632, "DescriptorBinding changed: update the binding encoder");
+static_assert(sizeof(DescriptorBinding) == 656, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 16, "FragmentParameter changed: update the parameter encoder");
@@ -140,7 +140,7 @@ constexpr std::size_t fieldCount() {
 
 static_assert(fieldCount<ShaderInfo>() == 23, "ShaderInfo changed: update the info encoder");
 static_assert(fieldCount<BufferResource>() == 12, "BufferResource changed: update the info encoder");
-static_assert(fieldCount<ImageResource>() == 38, "ImageResource changed: update the info encoder");
+static_assert(fieldCount<ImageResource>() == 39, "ImageResource changed: update the info encoder");
 static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: update the info encoder");
 static_assert(fieldCount<SampledResourcePair>() == 3, "SampledResourcePair changed: update the info encoder");
 static_assert(fieldCount<StageInput>() == 5, "StageInput changed: update the info encoder");
@@ -430,6 +430,7 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Flags(binding.samplerCoordinatesIgnored);
     writer.Values(std::span<const std::uint32_t>(binding.imageSamplers));
     writer.Flags(binding.bufferRead);
+    writer.Values(std::span<const std::uint32_t>(binding.bufferExtent));
 }
 
 void decodeBinding(Reader& reader, DescriptorBinding& binding) {
@@ -458,6 +459,7 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     reader.Flags(binding.samplerCoordinatesIgnored);
     reader.Values(binding.imageSamplers);
     reader.Flags(binding.bufferRead);
+    reader.Values(binding.bufferExtent);
 }
 
 void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
@@ -710,6 +712,7 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
         out.Value(image.flatLineCompatible);
         out.Value(image.flatVolumeLineCompatible);
         out.Value(image.foldTexelOffsetsOnly);
+        out.Value(image.convertedSamples);
         out.Value(image.byElements);
         out.Value(image.byComponents);
         out.Value(image.packedFormat);
@@ -812,6 +815,7 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
         in.Value(image.flatLineCompatible);
         in.Value(image.flatVolumeLineCompatible);
         in.Value(image.foldTexelOffsetsOnly);
+        in.Value(image.convertedSamples);
         in.Value(image.byElements);
         in.Value(image.byComponents);
         in.Value(image.packedFormat);
@@ -1274,6 +1278,8 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_PERF_ITERATION_SELECTION",
     "APS5_NO_PERF_LAYOUT_PAIR",
     "APS5_NO_RESULT_MEMO",
+    "APS5_NO_TABLE_RESOLUTION_REUSE",
+    "APS5_NO_TABLE_SNAPSHOT_REUSE",
 };
 
 const std::vector<std::byte>& switchKey() {

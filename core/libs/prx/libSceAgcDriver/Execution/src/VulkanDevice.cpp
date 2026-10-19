@@ -1614,6 +1614,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     enabled.geometryShader = available.geometryShader;
     state->geometryShader = enabled.geometryShader == VK_TRUE;
     state->sampleRateShading = enabled.sampleRateShading == VK_TRUE;
+    if (enabled.sampleRateShading) state->capabilities.push_back(spv::CapabilityInterpolationFunction);
     if (enabled.geometryShader) state->capabilities.push_back(spv::CapabilityGeometry);
     enabled.shaderClipDistance = available.shaderClipDistance;
     enabled.shaderCullDistance = available.shaderCullDistance;
@@ -2226,10 +2227,10 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
         // a title misbehaves with this path.
         if (drain) return 2;
         recordStore();
-        GuestMemory::MarkWritten(address, bytes.size());
         // Commands() opened the batch the store went into, so the completion is appended to that
         // batch and runs at its reap, after the write-backs of every batch before it.
         recorder.AfterCompletions(address, bytes, stamp, queue, true);
+        GuestMemory::MarkWritten(address, bytes.size());
         return 5;
     }
     recordStore();
@@ -2626,12 +2627,10 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
         }
         outcome.syncMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - syncStart).count();
     }
-    // A whole surface copied into another: a device copy between their images, whose results reach
-    // the destination's memory through the image's deferred write-back (nothing crosses to host
-    // memory for the copy itself).
     if (AliasCopy(context, destination, source, bytes)) {
         noteWriter({}, 0);
         recorder.NotePendingWrite(destination, bytes);
+        Graphics::StorageTexture::FlushPending(destination, bytes, nullptr, "buffer copy destination", Graphics::PublishScope::Whole);
         outcome.path = 3;
         return outcome;
     }
@@ -2685,6 +2684,8 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     recorder.EndGpuTiming(classTiming, bytes);
     recorder.MarkCovered(copiedAccess);
     recorder.NotePendingRead(source, bytes, Graphics::Recorder::ReadKind::CopySource);
+    GuestMemory::MarkWritten(destination, bytes);
+    recorder.NotePendingWrite(destination, bytes);
     // The destination's bytes after the transfer are the source's now when nothing recorded,
     // pending or still to land can change the source before the transfer reads it (a CPU store
     // to it in between is a hardware race too): the caller's ring entry carries them, stamped
